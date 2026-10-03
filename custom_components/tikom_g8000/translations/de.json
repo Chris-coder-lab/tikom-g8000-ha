@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tikom G8000",
+        "description": "Wähle den Staubsauger, den Tuya Local angelegt hat. Damit kommen Räume und Fahr-Tasten dazu.",
+        "data": {
+          "name": "Name",
+          "vacuum_entity": "Staubsauger (Tuya Local)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Dieser Staubsauger ist schon eingerichtet.",
+      "no_tuya_local": "Tuya Local ist nicht installiert. Zuerst über HACS installieren, Home Assistant neu starten und es erneut versuchen.",
+      "no_tuya_vacuum": "Die Gerätedatei für den G8000 wurde installiert. Lege jetzt deinen Roboter in Tuya Local an und wähle den Gerätetyp \"tikom_g8000_robot_vacuum_mop\" (fehlt der Typ, Home Assistant neu starten). Danach diese Integration erneut hinzufügen."
+    }
+  }
+}

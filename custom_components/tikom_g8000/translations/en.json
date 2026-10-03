@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tikom G8000",
+        "description": "Choose the vacuum created by Tuya Local. This adds rooms and drive controls.",
+        "data": {
+          "name": "Name",
+          "vacuum_entity": "Vacuum (Tuya Local)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This vacuum is already set up.",
+      "no_tuya_local": "Tuya Local is not installed. Install it with HACS first, restart Home Assistant and try again.",
+      "no_tuya_vacuum": "The device file for the G8000 was installed. Now add your robot in Tuya Local and pick the device type \"tikom_g8000_robot_vacuum_mop\" (restart Home Assistant if the type is missing). Then add this integration again."
+    }
+  }
+}

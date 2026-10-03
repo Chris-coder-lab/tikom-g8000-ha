@@ -1,0 +1,23 @@
+{
+  "domain": "tikom_g8000",
+  "name": "Tikom G8000",
+  "after_dependencies": [
+    "tuya_local"
+  ],
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [
+    "frontend",
+    "http",
+    "panel_custom",
+    "persistent_notification",
+    "vacuum",
+    "websocket_api"
+  ],
+  "documentation": "https://github.com/Chris-coder-lab/tikom-g8000-ha",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/Chris-coder-lab/tikom-g8000-ha/issues",
+  "requirements": [],
+  "version": "2.0.0"
+}
