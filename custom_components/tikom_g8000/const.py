@@ -1,7 +1,7 @@
 """Constants for Tikom G8000."""
 
 DOMAIN = "tikom_g8000"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 CONF_VACUUM = "vacuum_entity"
 

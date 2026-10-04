@@ -24,7 +24,7 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.util import slugify
 
-from . import planner
+from . import floorplan, planner
 from .const import (
     BATTERY_WAIT,
     CODE_TO_DIRECTION,
@@ -172,18 +172,6 @@ class Controller:
         settings.update(stored.get("settings", {}))
         calibration = {"speed_cm_s": 25.0, "turn_deg_s": 60.0, "calibrated": False}
         calibration.update(stored.get("calibration", {}))
-        plan = None
-        if stored.get("plan"):
-            try:
-                plan = planner.clean_plan(stored["plan"])
-            except planner.PlanError:
-                _LOGGER.warning("Gespeicherter Plan ist ungültig und wird ignoriert")
-        image = None
-        if stored.get("image"):
-            try:
-                image = planner.clean_image(stored["image"])
-            except planner.PlanError:
-                image = None
         rooms = {}
         for room_id, room in stored.get("rooms", {}).items():
             rooms[room_id] = {
@@ -195,17 +183,70 @@ class Controller:
                 "target": room.get("target"),
                 "use_recorded": bool(room.get("use_recorded", False)),
             }
+        floors: list[dict[str, Any]] = []
+        for raw in stored.get("floors", []):
+            try:
+                floor = floorplan.clean_floor(raw)
+                floor["image"] = planner.clean_image(raw.get("image"))
+            except planner.PlanError:
+                _LOGGER.warning("Ein gespeichertes Stockwerk ist ungültig und wird ignoriert")
+                continue
+            floors.append(floor)
+        if not floors and stored.get("plan"):
+            floors = self._migrate_old_plan(stored, rooms)
+        for room in rooms.values():
+            target = room.get("target")
+            if not (
+                isinstance(target, list)
+                and len(target) == 2
+                and all(isinstance(v, (int, float)) for v in target)
+            ):
+                room["target"] = None
+        settings.setdefault("robot_floor", floors[0]["id"] if floors else None)
+        if settings.get("robot_floor") not in {f["id"] for f in floors}:
+            settings["robot_floor"] = floors[0]["id"] if floors else None
         self.data = {
             "settings": settings,
             "calibration": calibration,
             "recording": stored.get("recording", ""),
             "new_room_name": stored.get("new_room_name", ""),
             "rooms": rooms,
-            "plan": plan,
-            "image": image,
+            "floors": floors,
         }
+        self._compiled: dict[str, dict[str, Any]] = {}
         for room_id in rooms:
             self._ensure_room_identity(room_id)
+
+    def _migrate_old_plan(
+        self, stored: dict[str, Any], rooms: dict[str, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Version 2.0 stored one grid plan; turn it into a floor made of shapes."""
+        try:
+            old = planner.clean_plan(stored["plan"])
+        except planner.PlanError:
+            _LOGGER.warning("Der alte Plan ist ungültig und wird ignoriert")
+            return []
+        for room_id, room in rooms.items():
+            if not room.get("idx"):
+                room["idx"] = None
+        by_index = {room["idx"]: room_id for room_id, room in rooms.items() if room.get("idx")}
+        floor = floorplan.grid_plan_to_floor(old, by_index)
+        try:
+            floor = floorplan.clean_floor(floor, set(rooms))
+        except planner.PlanError:
+            _LOGGER.warning("Der alte Plan konnte nicht übernommen werden")
+            return []
+        try:
+            floor["image"] = planner.clean_image(stored.get("image"))
+        except planner.PlanError:
+            floor["image"] = None
+        if floor["image"]:  # old images were placed in metres
+            floor["image"]["x_m"] = floor["image"]["x_m"]
+        for room in rooms.values():
+            target = room.get("target")
+            if isinstance(target, list) and len(target) == 2:
+                room["target"] = [target[0] * 10 + 5, target[1] * 10 + 5]
+        return [floor]
 
     def _save(self) -> None:
         self._store.async_delay_save(lambda: self.data, 1)
@@ -338,34 +379,113 @@ class Controller:
     # plan and rooms
     # ------------------------------------------------------------------
     @property
-    def plan(self) -> dict[str, Any] | None:
-        """The floor plan, if any."""
-        return self.data["plan"]
+    def floors(self) -> list[dict[str, Any]]:
+        """All floors (shapes, station, optional background image)."""
+        return self.data["floors"]
 
-    @property
-    def image(self) -> dict[str, Any] | None:
-        """Background image of the plan."""
-        return self.data["image"]
+    def floor(self, floor_id: str | None) -> dict[str, Any] | None:
+        """One floor by id."""
+        for floor in self.floors:
+            if floor["id"] == floor_id:
+                return floor
+        return None
+
+    def robot_floor(self) -> dict[str, Any] | None:
+        """The floor the robot's station is on right now."""
+        return self.floor(self.get_setting("robot_floor")) or (
+            self.floors[0] if self.floors else None
+        )
+
+    def room_floor(self, room_id: str) -> dict[str, Any] | None:
+        """The floor on which a room is drawn."""
+        for floor in self.floors:
+            for shape in floor["shapes"]:
+                if shape["kind"] == "room" and shape.get("room") == room_id:
+                    return floor
+        return None
+
+    def compiled(self, floor_id: str | None) -> dict[str, Any] | None:
+        """Grid version of a floor for the planner (cached)."""
+        floor = self.floor(floor_id)
+        if floor is None:
+            return None
+        if floor_id not in self._compiled:
+            index = {rid: r["idx"] for rid, r in self.rooms.items() if r.get("idx")}
+            try:
+                self._compiled[floor_id] = floorplan.compile_floor(floor, index)
+            except planner.PlanError as err:
+                raise HomeAssistantError(str(err)) from err
+        return self._compiled[floor_id]
+
+    def image_of(self, floor_id: str) -> dict[str, Any] | None:
+        """Background image of a floor (large)."""
+        floor = self.floor(floor_id)
+        return floor.get("image") if floor else None
 
     @callback
-    def save_plan(
-        self,
-        plan_raw: Any,
-        image_raw: Any = None,
-        set_image: bool = False,
-    ) -> None:
-        """Validate and store the plan (and optionally the background image)."""
+    def save_floor(
+        self, floor_raw: Any, image_raw: Any = None, set_image: bool = False
+    ) -> str:
+        """Validate and store one floor (new or replacing the one with the same id)."""
         try:
-            plan = planner.clean_plan(plan_raw)
-            image = planner.clean_image(image_raw) if set_image else self.image
+            floor = floorplan.clean_floor(floor_raw, set(self.rooms))
+            old = self.floor(floor["id"])
+            if set_image:
+                floor["image"] = planner.clean_image(image_raw)
+            else:
+                floor["image"] = old.get("image") if old else None
         except planner.PlanError as err:
             raise HomeAssistantError(str(err)) from err
-        used = {ch for row in plan["rows"] for ch in row}
-        known = {planner.ROOM_CHARS[r["idx"]] for r in self.rooms.values() if r.get("idx")}
-        if used - known - {"0"}:
-            raise HomeAssistantError("Der Plan enthält Räume, die es nicht gibt.")
-        self.data["plan"] = plan
-        self.data["image"] = image
+        if old is None:
+            if len(self.floors) >= floorplan.MAX_FLOORS:
+                raise HomeAssistantError(f"Höchstens {floorplan.MAX_FLOORS} Stockwerke.")
+            self.floors.append(floor)
+        else:
+            self.floors[self.floors.index(old)] = floor
+        self._compiled.pop(floor["id"], None)
+        if not self.get_setting("robot_floor"):
+            self.data["settings"]["robot_floor"] = floor["id"]
+        self._changed()
+        return floor["id"]
+
+    @callback
+    def add_floor(self, name: str) -> str:
+        """Create an empty floor."""
+        name = name.strip()[:30]
+        if not name:
+            raise HomeAssistantError("Der Name des Stockwerks ist leer.")
+        used = {floor["id"] for floor in self.floors}
+        number = 1
+        while f"f{number}" in used:
+            number += 1
+        return self.save_floor(
+            {"id": f"f{number}", "name": name, "walls": True, "shapes": [], "dock": None}
+        )
+
+    @callback
+    def delete_floor(self, floor_id: str) -> None:
+        """Delete a floor together with the rooms that are drawn on it."""
+        floor = self.floor(floor_id)
+        if floor is None:
+            return
+        if len(self.floors) <= 1:
+            raise HomeAssistantError("Das letzte Stockwerk kann nicht gelöscht werden.")
+        doomed = {s["room"] for s in floor["shapes"] if s["kind"] == "room"}
+        self.floors.remove(floor)
+        self._compiled.pop(floor_id, None)
+        if self.get_setting("robot_floor") == floor_id:
+            self.data["settings"]["robot_floor"] = self.floors[0]["id"]
+        for room_id in doomed:
+            if self.room_floor(room_id) is None:
+                self.delete_room(room_id)
+        self._changed()
+
+    @callback
+    def set_robot_floor(self, floor_id: str) -> None:
+        """Tell the controller which floor the robot stands on."""
+        if self.floor(floor_id) is None:
+            raise HomeAssistantError("Stockwerk nicht gefunden.")
+        self.data["settings"]["robot_floor"] = floor_id
         self._changed()
 
     def _free_index(self) -> int:
@@ -445,11 +565,8 @@ class Controller:
         if "target" in fields:
             target = fields["target"]
             if target is not None:
-                plan = self.plan
-                if plan is None:
-                    raise HomeAssistantError("Es gibt noch keinen Plan.")
                 x, y = int(target[0]), int(target[1])
-                if not (0 <= x < plan["w"] and 0 <= y < plan["h"]):
+                if not all(floorplan.COORD_MIN <= v <= floorplan.COORD_MAX for v in (x, y)):
                     raise HomeAssistantError("Ziel liegt außerhalb des Plans.")
                 target = [x, y]
             room["target"] = target
@@ -472,10 +589,15 @@ class Controller:
         room = self.rooms.get(room_id)
         if room is None:
             return
-        plan = self.plan
-        if plan is not None and room.get("idx"):
-            char = planner.ROOM_CHARS[room["idx"]]
-            plan["rows"] = [row.replace(char, "0") for row in plan["rows"]]
+        for floor in self.floors:
+            kept = [
+                shape
+                for shape in floor["shapes"]
+                if not (shape["kind"] == "room" and shape.get("room") == room_id)
+            ]
+            if len(kept) != len(floor["shapes"]):
+                floor["shapes"] = kept
+                self._compiled.pop(floor["id"], None)
         del self.rooms[room_id]
         if self.get_setting("selected_room") == room_id:
             self.data["settings"]["selected_room"] = None
@@ -495,10 +617,10 @@ class Controller:
         if room is None:
             raise HomeAssistantError("Raum nicht gefunden.")
         recorded = parse_route(room.get("route"))
-        plan = self.plan
-        planned_possible = bool(plan and plan.get("dock") and room.get("idx"))
+        floor = self.room_floor(room_id)
+        planned_possible = bool(floor and floor.get("dock") and room.get("idx"))
         if recorded and (room.get("use_recorded") or not planned_possible):
-            return {"source": "recorded", "steps": recorded, "path": None}
+            return {"source": "recorded", "steps": recorded, "path": None, "floor": None}
         if not planned_possible:
             raise HomeAssistantError(
                 "Für diesen Raum gibt es weder eine Aufnahme noch einen Plan mit Station."
@@ -509,13 +631,16 @@ class Controller:
                 "Erst kalibrieren (Geschwindigkeit und Drehrate messen), "
                 "damit die Route aus dem Plan stimmt."
             )
+        assert floor is not None
+        plan = self.compiled(floor["id"])
         assert plan is not None
         target = room.get("target")
+        cell_target = floorplan.cm_to_cell(plan, target[0], target[1]) if target else None
         try:
             found = planner.plan_path(
                 plan,
                 room["idx"],
-                tuple(target) if target else None,
+                cell_target,
                 block_carpet=mode in ("mop", "sweep_and_mop"),
             )
             steps = planner.steps_from_path(
@@ -523,33 +648,48 @@ class Controller:
             )
         except planner.PlanError as err:
             raise HomeAssistantError(str(err)) from err
-        return {"source": "plan", "steps": steps, "path": found["path"]}
+        return {"source": "plan", "steps": steps, "path": found["path"], "floor": floor["id"]}
+
+    def _line_cm(
+        self, floor_id: str | None, steps: list[tuple[str, float]]
+    ) -> list[list[float]] | None:
+        """Expected path of a step list on a floor, in centimetres."""
+        floor = self.floor(floor_id)
+        if floor is None or not floor.get("dock"):
+            return None
+        try:
+            plan = self.compiled(floor_id)
+        except HomeAssistantError:
+            return None
+        if plan is None or not plan.get("dock"):
+            return None
+        cal = self.calibration
+        points = planner.simulate(plan, steps, cal["speed_cm_s"], cal["turn_deg_s"])
+        return [
+            [round(v, 1) for v in floorplan.cell_to_cm(plan, x, y)] for x, y in points
+        ]
 
     def preview(self, room_id: str, mode: str) -> dict[str, Any]:
         """Route plus the polyline the robot is expected to drive (for the map)."""
         route = self.route_for_room(room_id, mode)
-        line = None
-        if self.plan and self.plan.get("dock"):
-            cal = self.calibration
-            line = planner.simulate(
-                self.plan, route["steps"], cal["speed_cm_s"], cal["turn_deg_s"]
-            )
+        floor = self.room_floor(room_id)
         return {
             "source": route["source"],
             "steps": route["steps"],
             "route": steps_to_string(route["steps"]),
             "seconds": round(sum(seconds for _, seconds in route["steps"]), 1),
-            "line": [[round(x, 2), round(y, 2)] for x, y in line] if line else None,
+            "floor": floor["id"] if floor else None,
+            "line": self._line_cm(floor["id"] if floor else None, route["steps"]),
         }
 
-    def recording_line(self) -> list[list[float]] | None:
-        """Expected path of the current recording on the plan."""
+    def recording_line(self) -> dict[str, Any] | None:
+        """Expected path of the current recording on the floor of the robot."""
         steps = parse_route(self.recording)
-        if not steps or not (self.plan and self.plan.get("dock")):
+        floor = self.robot_floor()
+        if not steps or floor is None:
             return None
-        cal = self.calibration
-        line = planner.simulate(self.plan, steps, cal["speed_cm_s"], cal["turn_deg_s"])
-        return [[round(x, 2), round(y, 2)] for x, y in line]
+        line = self._line_cm(floor["id"], steps)
+        return {"floor": floor["id"], "line": line} if line else None
 
     # ------------------------------------------------------------------
     # snapshot for the panel
@@ -558,9 +698,11 @@ class Controller:
         """Everything the panel needs, without the (large) background image."""
         rooms = {}
         for room_id, room in self.rooms.items():
+            floor = self.room_floor(room_id)
             rooms[room_id] = {
                 **room,
                 "has_route": bool(parse_route(room.get("route"))),
+                "floor": floor["id"] if floor else None,
             }
         return {
             "entry_id": self.entry.entry_id,
@@ -571,11 +713,23 @@ class Controller:
             "calibration": self.calibration,
             "recording": self.recording,
             "recording_line": self.recording_line(),
-            "plan": self.plan,
-            "has_image": self.image is not None,
-            "image_meta": (
-                {k: v for k, v in self.image.items() if k != "data"} if self.image else None
-            ),
+            "floors": [
+                {
+                    "id": floor["id"],
+                    "name": floor["name"],
+                    "walls": floor["walls"],
+                    "shapes": floor["shapes"],
+                    "dock": floor["dock"],
+                    "has_image": bool(floor.get("image")),
+                    "image_meta": (
+                        {k: v for k, v in floor["image"].items() if k != "data"}
+                        if floor.get("image")
+                        else None
+                    ),
+                }
+                for floor in self.floors
+            ],
+            "robot_floor": (self.robot_floor() or {}).get("id"),
             "rooms": rooms,
             "job": {
                 "running": self.job_running,
@@ -710,6 +864,18 @@ class Controller:
         """Whether a room job is running."""
         return self._job is not None and not self._job.done()
 
+    def _require_floor(self, room_id: str, route: dict[str, Any]) -> None:
+        """A planned route only works when the robot sits on the floor of the room."""
+        floor_id = route.get("floor")
+        robot = self.robot_floor()
+        if floor_id and robot and robot["id"] != floor_id:
+            target = self.floor(floor_id)
+            raise HomeAssistantError(
+                f'Der Roboter steht laut Plan im Stockwerk "{robot["name"]}", '
+                f'"{self.rooms[room_id]["name"]}" liegt im Stockwerk "{target["name"]}". '
+                f'Stelle ihn auf die Station dort und tippe auf "Roboter steht hier".'
+            )
+
     @callback
     def start_rooms(self, room_ids: list[str], mode: str | None = None) -> None:
         """Clean rooms one after the other in the background."""
@@ -725,7 +891,7 @@ class Controller:
             raise HomeAssistantError("Unbekannter Modus.")
         # fail early, before anything moves: every route must be computable
         for room_id in rooms:
-            self.route_for_room(room_id, mode)
+            self._require_floor(room_id, self.route_for_room(room_id, mode))
         self.job_mode = mode
         self.queue = list(rooms)
         self._job = self.hass.async_create_background_task(
@@ -740,7 +906,7 @@ class Controller:
         if room_id not in self.rooms:
             raise HomeAssistantError("Raum nicht gefunden.")
         mode = self.get_setting("clean_mode")
-        self.route_for_room(room_id, mode)
+        self._require_floor(room_id, self.route_for_room(room_id, mode))
         self.job_mode = mode
         self.queue = [room_id]
         self._job = self.hass.async_create_background_task(
@@ -785,6 +951,7 @@ class Controller:
             )
             raise HomeAssistantError("Roboter nicht auf der Station")
         route = self.route_for_room(room_id, mode)
+        self._require_floor(room_id, route)
 
         battery = self.battery_entity()
         minimum = float(self.get_setting("min_battery"))

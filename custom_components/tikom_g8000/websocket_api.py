@@ -64,22 +64,48 @@ async def ws_snapshot(hass, c, msg):
     return c.snapshot()
 
 
-@_command({vol.Required("type"): f"{DOMAIN}/get_image"})
-async def ws_get_image(hass, c, msg):
-    """The background image of the plan."""
-    return {"image": c.image}
+FLOOR_ID = vol.All(str, vol.Length(min=1, max=24), vol.Match(r"^[A-Za-z0-9_-]+$"))
 
 
 @_command(
     {
-        vol.Required("type"): f"{DOMAIN}/save_plan",
-        vol.Required("plan"): dict,
-        vol.Optional("image"): vol.Any(None, dict),
+        vol.Required("type"): f"{DOMAIN}/get_image",
+        vol.Required("floor_id"): FLOOR_ID,
     }
 )
-async def ws_save_plan(hass, c, msg):
-    """Store the floor plan (and the background image if it is part of the message)."""
-    c.save_plan(msg["plan"], msg.get("image"), set_image="image" in msg)
+async def ws_get_image(hass, c, msg):
+    """The background image of a floor."""
+    return {"image": c.image_of(msg["floor_id"])}
+
+
+@_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/floor",
+        vol.Required("action"): vol.In(["save", "add", "delete", "robot_here"]),
+        vol.Optional("floor"): dict,
+        vol.Optional("image"): vol.Any(None, dict),
+        vol.Optional("floor_id"): FLOOR_ID,
+        vol.Optional("name"): NAME,
+    }
+)
+async def ws_floor(hass, c, msg):
+    """Save a floor, add or delete one, or say on which floor the robot stands."""
+    action = msg["action"]
+    if action == "save":
+        if "floor" not in msg:
+            raise HomeAssistantError("Stockwerk fehlt.")
+        floor_id = c.save_floor(msg["floor"], msg.get("image"), set_image="image" in msg)
+        return {"floor_id": floor_id}
+    if action == "add":
+        if "name" not in msg:
+            raise HomeAssistantError("Name fehlt.")
+        return {"floor_id": c.add_floor(msg["name"])}
+    if "floor_id" not in msg:
+        raise HomeAssistantError("floor_id fehlt.")
+    if action == "delete":
+        c.delete_floor(msg["floor_id"])
+    else:
+        c.set_robot_floor(msg["floor_id"])
     return {}
 
 
@@ -92,7 +118,7 @@ async def ws_save_plan(hass, c, msg):
         vol.Optional("color"): COLOR,
         vol.Optional("minutes"): vol.All(vol.Coerce(float), vol.Range(min=1, max=90)),
         vol.Optional("target"): vol.Any(
-            None, vol.All([vol.All(int, vol.Range(min=0, max=199))], vol.Length(2, 2))
+            None, vol.All([vol.All(vol.Coerce(int), vol.Range(min=-5000, max=10000))], vol.Length(2, 2))
         ),
         vol.Optional("use_recorded"): bool,
     }
@@ -299,7 +325,7 @@ def async_register(hass: HomeAssistant) -> None:
     for handler in (
         ws_snapshot,
         ws_get_image,
-        ws_save_plan,
+        ws_floor,
         ws_room,
         ws_preview,
         ws_clean,

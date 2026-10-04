@@ -15,7 +15,7 @@ from typing import Any
 
 CELL_M = 0.1  # edge length of one cell in metres
 MIN_SIZE = 10
-MAX_SIZE = 200  # cells per side (= 20 m)
+MAX_SIZE = 600  # cells per side (= 60 m)
 MAX_ROOMS = 35
 ROOM_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"  # '0' = wall / outside
 UNDOCK_M = 0.3  # backing out distance when the robot faces the dock
@@ -323,6 +323,19 @@ def dock_start(plan: dict[str, Any]) -> tuple[float, float, float, list[tuple[st
     return dock["x"], dock["y"], heading, []
 
 
+def _nearest_walkable(
+    grid: Grid, cell: tuple[int, int], reach: int
+) -> tuple[int, int] | None:
+    best = None
+    best_distance = math.inf
+    for dy in range(-reach, reach + 1):
+        for dx in range(-reach, reach + 1):
+            x, y = cell[0] + dx, cell[1] + dy
+            if grid.walkable(x, y) and dx * dx + dy * dy < best_distance:
+                best, best_distance = (x, y), dx * dx + dy * dy
+    return best
+
+
 def plan_path(
     plan: dict[str, Any],
     room_index: int,
@@ -334,11 +347,14 @@ def plan_path(
 
     Returns {"path": [(x, y), ...], "clearance": used clearance}.
     """
-    grid = Grid(plan)
+    grid = plan.get("_grid") or Grid(plan)
+    plan["_grid"] = grid
     sx, sy, _, _ = dock_start(plan)
     start = (min(max(round(sx), 0), grid.w - 1), min(max(round(sy), 0), grid.h - 1))
     if not grid.walkable(*start):
-        raise PlanError("Die Ladestation liegt nicht auf einer Raumfläche.")
+        start = _nearest_walkable(grid, start, 4) or start
+    if not grid.walkable(*start):
+        raise PlanError("Die Ladestation liegt nicht in einem Raum.")
     if target is None:
         target = default_target(grid, room_index, avoid_carpet=block_carpet)
     if target is None:
@@ -347,7 +363,9 @@ def plan_path(
         raise PlanError("Das Ziel liegt nicht auf einer Raumfläche.")
     if block_carpet and grid.carpet[target[1]][target[0]]:
         raise PlanError("Das Ziel liegt auf Teppich, Wischen ist dort nicht erlaubt.")
-    dist = grid.distance_to_wall()
+    if "_dist" not in plan:
+        plan["_dist"] = grid.distance_to_wall()
+    dist = plan["_dist"]
     for used in range(clearance, -1, -1):
         free = _passable_map(grid, dist, used, block_carpet, start)
         free[target[1]][target[0]] = True
