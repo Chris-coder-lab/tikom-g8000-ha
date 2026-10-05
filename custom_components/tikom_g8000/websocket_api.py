@@ -120,6 +120,7 @@ async def ws_floor(hass, c, msg):
             None, vol.All([vol.All(vol.Coerce(int), vol.Range(min=-5000, max=10000))], vol.Length(2, 2))
         ),
         vol.Optional("use_recorded"): bool,
+        vol.Optional("route"): vol.All(str, vol.Length(max=1000)),
     }
 )
 async def ws_room(hass, c, msg):
@@ -139,7 +140,9 @@ async def ws_room(hass, c, msg):
         c.delete_room(msg["room_id"])
         return {}
     fields = {
-        k: msg[k] for k in ("name", "color", "minutes", "target", "use_recorded") if k in msg
+        k: msg[k]
+        for k in ("name", "color", "minutes", "target", "route", "use_recorded")
+        if k in msg
     }
     c.update_room(msg["room_id"], **fields)
     return {}
@@ -150,11 +153,13 @@ async def ws_room(hass, c, msg):
         vol.Required("type"): f"{DOMAIN}/preview",
         vol.Required("room_id"): ROOM_ID,
         vol.Optional("mode", default="sweep_and_mop"): MODE,
+        vol.Optional("draft"): vol.All(str, vol.Length(max=1000)),
+        vol.Optional("recorded", default=False): bool,
     }
 )
 async def ws_preview(hass, c, msg):
-    """Route and expected path for a room."""
-    return c.preview(msg["room_id"], msg["mode"])
+    """Route and expected path for a room (or for a route typed in the editor)."""
+    return c.preview(msg["room_id"], msg["mode"], msg.get("draft"), msg["recorded"])
 
 
 @_command(

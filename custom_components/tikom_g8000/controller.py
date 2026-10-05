@@ -711,8 +711,16 @@ class Controller:
             room["color"] = fields["color"]
         if "minutes" in fields:
             room["minutes"] = min(max(float(fields["minutes"]), 1.0), 90.0)
+        if "route" in fields:
+            # A typed or edited route: checked strictly, so nothing is silently dropped.
+            steps = parse_route_strict(fields["route"])
+            room["route"] = steps_to_string(steps)
+            if not steps:
+                room["use_recorded"] = False
         if "use_recorded" in fields:
-            room["use_recorded"] = bool(fields["use_recorded"])
+            room["use_recorded"] = bool(fields["use_recorded"]) and bool(
+                parse_route(room.get("route"))
+            )
         if "target" in fields:
             target = fields["target"]
             if target is not None:
@@ -849,10 +857,31 @@ class Controller:
             [round(v, 1) for v in floorplan.cell_to_cm(plan, x, y)] for x, y in points
         ]
 
-    def preview(self, room_id: str, mode: str) -> dict[str, Any]:
-        """Route plus the polyline the robot is expected to drive (for the map)."""
-        route = self.route_for_room(room_id, mode)
+    def preview(
+        self,
+        room_id: str,
+        mode: str,
+        draft: str | None = None,
+        recorded: bool = False,
+    ) -> dict[str, Any]:
+        """Route plus the polyline the robot is expected to drive (for the map).
+
+        With ``draft`` the typed (not yet saved) route of the editor is shown;
+        with ``recorded`` the saved route of the room is shown even when the
+        room is set to "from the plan".
+        """
         floor = self.room_floor(room_id)
+        if draft is not None or recorded:
+            if room_id not in self.rooms:
+                raise HomeAssistantError("Raum nicht gefunden.")
+            steps = (
+                parse_route_strict(draft)
+                if draft is not None
+                else parse_route(self.rooms[room_id].get("route"))
+            )
+            route = {"source": "recorded", "steps": steps}
+        else:
+            route = self.route_for_room(room_id, mode)
         return {
             "mode": self.effective_mode(room_id, mode),
             "source": route["source"],
@@ -860,7 +889,11 @@ class Controller:
             "route": steps_to_string(route["steps"]),
             "seconds": round(sum(seconds for _, seconds in route["steps"]), 1),
             "floor": floor["id"] if floor else None,
-            "line": self._line_cm(floor["id"] if floor else None, route["steps"]),
+            "line": (
+                self._line_cm(floor["id"] if floor else None, route["steps"])
+                if route["steps"]
+                else None
+            ),
         }
 
     def recording_line(self) -> dict[str, Any] | None:
@@ -1060,6 +1093,11 @@ class Controller:
             "settings": self.data["settings"],
             "calibration": self.calibration,
             "recording": self.recording,
+            "limits": {
+                "max_step_seconds": planner.MAX_STEP_SECONDS,
+                "max_steps": planner.MAX_STEPS * 2,
+                "max_route_length": MAX_ROUTE_LENGTH,
+            },
             "recording_line": self.recording_line(),
             "floors": [
                 {

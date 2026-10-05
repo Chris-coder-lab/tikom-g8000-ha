@@ -186,6 +186,17 @@ details > summary { cursor: pointer; font-size: 13px; color: var(--tk-soft); }
 .cand .num { margin-left: auto; }
 .link { background: none; border: 0; padding: 0; color: var(--tk-accent); text-decoration: underline; font-size: inherit; }
 .roomrow .sub { grid-column: 1 / -1; }
+.hint.bad { color: var(--tk-bad); }
+.routeedit { padding: 10px; border: 1px solid var(--tk-line); border-radius: 12px; background: rgba(127,127,127,.06); }
+.steps { display: grid; gap: 6px; margin-top: 6px; }
+.steprow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.steprow .num { width: 18px; text-align: right; }
+.steprow select { flex: 1 1 120px; min-width: 0; }
+.steprow input[type=number] { width: 72px; flex: none; }
+.stepcode { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; padding: 2px 6px; border-radius: 6px; background: rgba(127,127,127,.16); min-width: 44px; text-align: center; }
+.stepbtns { display: flex; gap: 4px; margin-left: auto; }
+.stepbtns .btn { padding: 6px 0; width: 32px; }
+.stepbtns .btn[disabled] { opacity: .35; }
 .saved { color: var(--tk-soft); }
 @media (max-width: 520px) {
   .drawopts .field.fit { flex: 1 0 100%; }
@@ -1411,6 +1422,7 @@ class TikomPanel extends HTMLElement {
     this.tab = "home"; this.snap = null; this.fid = ""; this.fl = null; this.undo = [];
     this.dirty = false; this.rev = 0; this.saving = false; this.saveState = ""; this.saveTimer = 0;
     this.sel = new Set(); this.activeRoom = null; this.preview = null; this.previewKey = "";
+    this.routeDrafts = {}; this.draftLine = null; this.draftFocus = null; this._draftTimer = null;
     this.tool = "select"; this.shapeType = "rect"; this.what = "new"; this.brush = 30; this.unit = "cm";
     this.addSize = JSON.parse(JSON.stringify(DEFAULT_SIZE)); this.newRoomOpen = false;
     this.images = {}; this.imgOver = {}; this.imgLoading = {}; this.imgDirty = false; this.imgRev = 0;
@@ -1546,6 +1558,8 @@ class TikomPanel extends HTMLElement {
     const s = this.snap, out = [];
     if (this.preview?.line && this.preview.floor === this.fid) out.push({ pts: this.preview.line, color: "#ffffff", dashed: true });
     if (s?.recording_line && s.recording_line.floor === this.fid) out.push({ pts: s.recording_line.line, color: "#ffd54f", dashed: true });
+    const d = this.draftLine;
+    if (d && this.routeDrafts[d.room] && d.line && d.floor === this.fid) out.push({ pts: d.line, color: "#ff9800", dashed: true });
     this.pv.lines = out;
   }
 
@@ -1644,10 +1658,11 @@ class TikomPanel extends HTMLElement {
 
   /* ---- preview of a route */
   async _loadPreview() {
-    const id = [...this.sel][0], s = this.snap;
+    const s = this.snap;
+    const id = this.tab === "plan" ? (this.activeRoom && s.rooms[this.activeRoom] ? this.activeRoom : null) : [...this.sel][0];
     const mode = s.settings.clean_mode || "sweep_and_mop";
     const f = s.floors.find((q) => q.id === s.rooms[id]?.floor);
-    const key = id ? `${id}|${mode}|${JSON.stringify(s.calibration)}|${JSON.stringify(f ? [f.shapes, f.dock, f.walls, f.open] : null)}|${s.settings.carpet_sweep_only}|${s.rooms[id]?.use_recorded}|${s.rooms[id]?.target}` : "";
+    const key = id ? `${this.tab === "plan" ? "p" : "h"}|${id}|${s.rooms[id]?.route}|${mode}|${JSON.stringify(s.calibration)}|${JSON.stringify(f ? [f.shapes, f.dock, f.walls, f.open] : null)}|${s.settings.carpet_sweep_only}|${s.rooms[id]?.use_recorded}|${s.rooms[id]?.target}` : "";
     if (key === this.previewKey) return;
     this.previewKey = key;
     if (!id) { this.preview = null; this._lines(); this.pv.draw(); return; }
@@ -2112,6 +2127,97 @@ Object.assign(TikomPanel.prototype, {
         <div class="row">${s.t === "rect" ? `<button class="btn" data-act="sh-rot">Breite und Länge tauschen</button>` : ""}<button class="btn" data-act="sh-dup">Duplizieren</button><button class="btn danger" data-act="sh-del">Löschen</button></div></div></div>`;
   },
 
+  /* ---- editor for the steps of a saved route ("Aus meiner Aufnahme") */
+  _rLimits() {
+    const l = this.snap.limits || {};
+    return { sec: l.max_step_seconds || 30, steps: l.max_steps || 120, len: l.max_route_length || 255 };
+  },
+  _rParse(text) {
+    const out = [];
+    for (const raw of String(text || "").split(/[,;\n]+/)) {
+      const tok = raw.trim().toLowerCase();
+      const v = Number(tok.slice(1));
+      if (tok.length >= 2 && "fblr".includes(tok[0]) && Number.isFinite(v) && v > 0) out.push([tok[0], Math.round(v * 10) / 10 || 0.1]);
+    }
+    return out;
+  },
+  _rText(steps) { return steps.map(([c, s]) => c + s.toFixed(1)).join(","); },
+  _rSecs(steps) { return Math.round(steps.reduce((a, st) => a + st[1], 0) * 10) / 10; },
+  _rDirty(id) {
+    const d = this.routeDrafts[id];
+    return !!d && this._rText(d) !== this._rText(this._rParse(this.snap.rooms[id]?.route));
+  },
+  _rValid(id) {
+    const d = this.routeDrafts[id], l = this._rLimits();
+    return !!d && d.length <= l.steps && this._rText(d).length <= l.len && d.every((st) => st[1] >= 0.1 && st[1] <= l.sec);
+  },
+  _rSummary(id) {
+    const d = this.routeDrafts[id], l = this._rLimits();
+    return `${d.length} ${d.length === 1 ? "Schritt" : "Schritte"}, ${this._rSecs(d).toFixed(1)} s, ${this._rText(d).length} von ${l.len} Zeichen`;
+  },
+  _rRefresh(id) {
+    const d = this.routeDrafts[id];
+    if (!d) return;
+    const root = this.shadowRoot, dirty = this._rDirty(id), ok = this._rValid(id);
+    d.forEach(([c, s], i) => { const el = root.querySelector(`[data-rcode="${id}:${i}"]`); if (el) el.textContent = c + s.toFixed(1); });
+    const tot = root.getElementById(`rtot-${id}`); if (tot) { tot.textContent = this._rSummary(id); tot.classList.toggle("bad", !ok); }
+    const sv = root.getElementById(`rsave-${id}`); if (sv) sv.disabled = !dirty || !ok;
+    const rs = root.getElementById(`rreset-${id}`); if (rs) rs.disabled = !dirty;
+  },
+  _rPreview(id) {
+    clearTimeout(this._draftTimer);
+    this._draftTimer = setTimeout(async () => {
+      const d = this.routeDrafts[id];
+      if (!d) return;
+      const text = this._rText(d);
+      try {
+        const p = await this.ws("preview", { room_id: id, mode: this.snap.settings.clean_mode || "sweep_and_mop", draft: text });
+        if (this.routeDrafts[id] && this._rText(this.routeDrafts[id]) === text) this.draftLine = { room: id, line: p.line, floor: p.floor };
+      } catch (err) { this.draftLine = null; }
+      this._lines(); this.pv.draw();
+    }, 180);
+  },
+  _routeEditor(id, r) {
+    const d = this.routeDrafts[id], saved = this._rParse(r.route);
+    if (!d) {
+      const label = r.has_route ? `Schritte bearbeiten (${saved.length} ${saved.length === 1 ? "Schritt" : "Schritte"}, ${this._rSecs(saved).toFixed(1)} s)` : "Route eintippen";
+      return `<div class="sub"><button class="link" data-act="route-open" data-room="${esc(id)}">${label}</button></div>`;
+    }
+    const l = this._rLimits(), dirty = this._rDirty(id), ok = this._rValid(id), e = esc(id);
+    const DIRS = [["f", "Vor"], ["b", "Zurück"], ["l", "Links drehen"], ["r", "Rechts drehen"]];
+    const rows = d.map(([c, s], i) => `<div class="steprow">
+        <span class="num small hint">${i + 1}</span>
+        <select data-change="rs-dir" data-room="${e}" data-i="${i}" aria-label="Richtung Schritt ${i + 1}">${DIRS.map(([k, t]) => `<option value="${k}" ${c === k ? "selected" : ""}>${t}</option>`).join("")}</select>
+        <input type="number" inputmode="decimal" min="0.1" max="${l.sec}" step="0.1" value="${s.toFixed(1)}" data-change="rs-sec" data-room="${e}" data-i="${i}" aria-label="Sekunden Schritt ${i + 1}">
+        <span class="small hint">s</span>
+        <code class="stepcode" data-rcode="${e}:${i}">${c}${s.toFixed(1)}</code>
+        <span class="stepbtns">
+          <button class="btn" data-act="rs-up" data-room="${e}" data-i="${i}" ${i ? "" : "disabled"} aria-label="Schritt ${i + 1} nach oben">↑</button>
+          <button class="btn" data-act="rs-down" data-room="${e}" data-i="${i}" ${i < d.length - 1 ? "" : "disabled"} aria-label="Schritt ${i + 1} nach unten">↓</button>
+          <button class="btn" data-act="rs-ins" data-room="${e}" data-i="${i}" ${d.length < l.steps ? "" : "disabled"} aria-label="Gleichen Schritt darunter einfügen">+</button>
+          <button class="btn" data-act="rs-del" data-room="${e}" data-i="${i}" aria-label="Schritt ${i + 1} löschen">✕</button></span></div>`).join("");
+    const closeTxt = dirty && this.confirm === `rclose:${id}` ? "Änderungen verwerfen?" : "Schließen";
+    const notUsed = r.has_route && !r.use_recorded
+      ? `<div class="notice small">Diese Route wird noch nicht gefahren, der Raum steht auf „Aus dem Plan berechnen“.
+          <button class="link" data-act="route-use" data-room="${e}" ${dirty ? "disabled" : ""}>Diese Route verwenden</button>${dirty ? " (erst speichern)" : ""}</div>`
+      : "";
+    const unseen = this.draftLine && this.draftLine.room === id && !this.draftLine.line
+      ? `<p class="hint small">Keine Linie im Plan: Der Raum braucht einen gezeichneten Plan mit Station.</p>` : "";
+    return `<div class="sub routeedit">
+      <div class="row between"><b class="small">Route zum Raum, Schritt für Schritt</b><button class="link" data-act="route-close" data-room="${e}">${closeTxt}</button></div>
+      <p class="hint small">Ein Schritt ist Richtung plus Sekunden, zum Beispiel <code>r1.0</code> für 1 Sekunde nach rechts drehen. Die orange gestrichelte Linie im Plan zeigt, wohin der Roboter damit von der Station aus fährt.</p>
+      <div class="steps">${rows || `<p class="hint small">Noch kein Schritt.</p>`}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" data-act="rs-add" data-room="${e}" ${d.length < l.steps ? "" : "disabled"}>Schritt hinzufügen</button>
+        <button class="btn" data-act="route-from-rec" data-room="${e}" ${this.snap.recording ? "" : "disabled"}>Aktuelle Aufnahme übernehmen</button>
+        <button class="btn" data-act="route-to-hand" data-room="${e}" ${d.length && ok ? "" : "disabled"}>Zum Testen nach „Hand fahren“</button></div>
+      <p class="hint small ${ok ? "" : "bad"}" id="rtot-${e}" style="margin:8px 0 0">${esc(this._rSummary(id))}</p>
+      ${unseen}${notUsed}
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary" id="rsave-${e}" data-act="route-save" data-room="${e}" ${dirty && ok ? "" : "disabled"}>${d.length ? "Route speichern" : "Route entfernen"}</button>
+        <button class="btn" id="rreset-${e}" data-act="route-reset" data-room="${e}" ${dirty ? "" : "disabled"}>Zurücksetzen</button></div></div>`;
+  },
+
   _roomsCard() {
     const rooms = this.roomsHere();
     const area = {};
@@ -2126,6 +2232,7 @@ Object.assign(TikomPanel.prototype, {
           · <button class="link" data-act="room-pick" data-room="${esc(id)}" data-then="draw">hier zeichnen</button>
           · <button class="link" data-act="room-pick" data-room="${esc(id)}" data-then="target">Zielpunkt setzen</button></div>
         ${r.has_route ? `<label class="field sub">Weg zum Raum<select data-change="room-src" data-room="${esc(id)}"><option value="plan" ${r.use_recorded ? "" : "selected"}>Aus dem Plan berechnen</option><option value="rec" ${r.use_recorded ? "selected" : ""}>Aus meiner Aufnahme</option></select></label>` : ""}
+        ${this._routeEditor(id, r)}
       </div>`).join("");
     return `<div class="card"><h2>Räume in „${esc(this.fl.name)}“</h2>${rows || `<p class="hint">Noch kein Raum. Lege deinen ersten an und zeichne ihn dann mit Maßen.</p>`}
       <div class="row" style="margin-top:10px"><input type="text" id="newroom" placeholder="Neuer Raum, z. B. Wohnzimmer" maxlength="40" style="flex:1"><button class="btn primary" data-act="room-add">Anlegen</button></div>
@@ -2270,6 +2377,12 @@ function offsetShape(s, dx, dy) {
 Object.assign(TikomPanel.prototype, {
   _input(e) {
     const t = e.target;
+    if (t.dataset.change === "rs-sec") {
+      /* live while typing: only valid numbers count, the field itself is not touched */
+      const id = t.dataset.room, d = this.routeDrafts[id], i = Number(t.dataset.i), v = Number(t.value);
+      if (d?.[i] && Number.isFinite(v) && v >= 0.1 && v <= this._rLimits().sec) { d[i][1] = Math.round(v * 10) / 10; this._rRefresh(id); this._rPreview(id); }
+      return;
+    }
     if (t.dataset.change === "img-o" && this.images[this.fid]) {
       this.imgOver[this.fid] = { ...this._meta(), opacity: Number(t.value) };
       this.pv.imageMeta = this.imgOver[this.fid]; this.pv.draw();
@@ -2511,7 +2624,7 @@ Object.assign(TikomPanel.prototype, {
     const a = t.dataset.act, s = this.snap, pv = this.pv;
     switch (a) {
       case "tab":
-        this.tab = t.dataset.tab; this.confirm = ""; pv.resetInteraction(); this._needFit = true; this._render(); break;
+        this.tab = t.dataset.tab; this.confirm = ""; pv.resetInteraction(); this._needFit = true; this._loadPreview(); this._render(); break;
       case "svc": this.svc("vacuum", t.dataset.s, { entity_id: s.vacuum }); break;
       case "sel": this._toggleRoom(t.dataset.room); break;
       case "mode": await this.act("setting", { key: "clean_mode", value: t.dataset.mode }); break;
@@ -2642,6 +2755,49 @@ Object.assign(TikomPanel.prototype, {
       case "detect-clear": this.det.cands = []; this.det.ran = false; pv.cands = []; this._render(); pv.draw(); break;
       case "det-auto": this.det.thresh = null; this._runDetect(); break;
 
+      /* steps of a saved room route */
+      case "route-open": {
+        const id = t.dataset.room;
+        this.routeDrafts[id] = this._rParse(s.rooms[id]?.route);
+        this.activeRoom = id; this.draftFocus = id; this._loadPreview(); this._rPreview(id); this._render(); break;
+      }
+      case "route-close": {
+        const id = t.dataset.room;
+        if (this._rDirty(id) && this.confirm !== `rclose:${id}`) { this.confirm = `rclose:${id}`; this._render(); return; }
+        this.confirm = ""; delete this.routeDrafts[id];
+        if (this.draftLine?.room === id) this.draftLine = null;
+        this._lines(); pv.draw(); this._render(); break;
+      }
+      case "route-reset": { const id = t.dataset.room; this.routeDrafts[id] = this._rParse(s.rooms[id]?.route); this._rPreview(id); this._render(); break; }
+      case "rs-add": case "rs-ins": case "rs-up": case "rs-down": case "rs-del": {
+        const id = t.dataset.room, d = this.routeDrafts[id], i = Number(t.dataset.i), lim = this._rLimits();
+        if (!d) break;
+        if (a === "rs-add") { if (d.length < lim.steps) d.push(["f", 1.0]); }
+        else if (a === "rs-ins") { if (d.length < lim.steps && d[i]) d.splice(i + 1, 0, [...d[i]]); }
+        else if (a === "rs-up") { if (i > 0 && d[i]) [d[i - 1], d[i]] = [d[i], d[i - 1]]; }
+        else if (a === "rs-down") { if (d[i + 1]) [d[i + 1], d[i]] = [d[i], d[i + 1]]; }
+        else d.splice(i, 1);
+        this.confirm = ""; this._rPreview(id); this._render(); break;
+      }
+      case "route-from-rec": {
+        const id = t.dataset.room, steps = this._rParse(s.recording);
+        if (!steps.length) { this.toast("Die Aufnahme ist leer.", true); break; }
+        this.routeDrafts[id] = steps; this._rPreview(id); this._render(); break;
+      }
+      case "route-to-hand": {
+        const id = t.dataset.room, d = this.routeDrafts[id];
+        if (d?.length) await this.act("recording", { action: "set", route: this._rText(d) }, "Geladen. Unter „Hand fahren“ auf Abspielen tippen.");
+        break;
+      }
+      case "route-save": {
+        const id = t.dataset.room, d = this.routeDrafts[id];
+        if (!d || !this._rValid(id)) break;
+        const r = await this.act("room", { action: "update", room_id: id, route: this._rText(d) }, d.length ? "Route gespeichert" : "Route entfernt");
+        if (r) { this._loadPreview(); this._render(); }
+        break;
+      }
+      case "route-use": await this.act("room", { action: "update", room_id: t.dataset.room, use_recorded: true }, "Der Raum fährt jetzt diese Route"); break;
+
       /* driving */
       case "drive": await this.act("drive", { direction: t.dataset.d, seconds: Number(s.settings.step_seconds) }); break;
       case "rec": await this.act("recording", { action: t.dataset.r }, t.dataset.r === "test" ? "Spiele ab" : ""); break;
@@ -2683,6 +2839,18 @@ Object.assign(TikomPanel.prototype, {
       case "room-name": await this.act("room", { action: "update", room_id: t.dataset.room, name: t.value.trim() || s.rooms[t.dataset.room].name }); break;
       case "room-color": await this.act("room", { action: "update", room_id: t.dataset.room, color: t.value }); break;
       case "room-minutes": await this.act("room", { action: "update", room_id: t.dataset.room, minutes: Number(t.value) }); break;
+      case "rs-dir": {
+        const id = t.dataset.room, d = this.routeDrafts[id], i = Number(t.dataset.i);
+        if (d?.[i] && "fblr".includes(t.value)) { d[i][0] = t.value; this._rRefresh(id); this._rPreview(id); }
+        break;
+      }
+      case "rs-sec": {
+        const id = t.dataset.room, d = this.routeDrafts[id], i = Number(t.dataset.i);
+        if (!d?.[i]) break;
+        const v = Number(String(t.value).replace(",", "."));
+        if (Number.isFinite(v) && v > 0) d[i][1] = clamp(Math.round(v * 10) / 10, 0.1, this._rLimits().sec);
+        t.value = d[i][1].toFixed(1); this._rRefresh(id); this._rPreview(id); break;
+      }
       case "room-src": await this.act("room", { action: "update", room_id: t.dataset.room, use_recorded: t.value === "rec" }); break;
       case "setting-str": await this.act("setting", { key: t.dataset.key, value: t.value }); break;
       case "setting-num": { const v = Number(t.value); if (Number.isFinite(v)) await this.act("setting", { key: t.dataset.key, value: v }); break; }
