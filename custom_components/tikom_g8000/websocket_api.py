@@ -175,6 +175,13 @@ async def ws_clean(hass, c, msg):
     return {}
 
 
+@_command({vol.Required("type"): f"{DOMAIN}/undock"})
+async def ws_undock(hass, c, msg):
+    """Take the robot off the station by starting and stopping a cleaning."""
+    c.start_undock()
+    return {}
+
+
 @_command({vol.Required("type"): f"{DOMAIN}/abort"})
 async def ws_abort(hass, c, msg):
     """Stop everything and go home."""
@@ -269,6 +276,8 @@ async def ws_calibration(hass, c, msg):
                 "verify_leave_dock",
                 "carpet_sweep_only",
                 "repeat_drive",
+                "undock_mode",
+                "undock_seconds",
             ]
         ),
         vol.Required("value"): vol.Any(str, int, float, bool),
@@ -336,6 +345,7 @@ def async_register(hass: HomeAssistant) -> None:
         ws_room,
         ws_preview,
         ws_clean,
+        ws_undock,
         ws_abort,
         ws_drive,
         ws_recording,

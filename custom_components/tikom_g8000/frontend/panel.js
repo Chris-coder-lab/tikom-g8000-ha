@@ -1800,7 +1800,8 @@ class TikomPanel extends HTMLElement {
       const names = s.job.queue.map((id) => s.rooms[id]?.name).filter(Boolean);
       return `<div class="card"><h2>Läuft gerade</h2><p>${esc(s.job.phase || "Starte")}</p>
         <p class="hint" style="margin:6px 0 12px">${names.length ? `Noch offen: ${esc(names.join(", "))}` : ""}</p>
-        <button class="btn danger big" data-act="abort">Abbrechen und zur Station</button></div>`;
+        <button class="btn danger big" data-act="abort">Abbrechen und zur Station</button>
+        ${s.job.trace?.length ? `<details open style="margin-top:12px"><summary>Verlauf bis jetzt</summary><pre class="trace">${esc(s.job.trace.join("\n"))}</pre></details>` : ""}</div>`;
     }
     const picked = [...this.sel].map((id) => s.rooms[id]?.name).filter(Boolean);
     let info = `<p class="hint">Wähle einen oder mehrere Räume im Plan.</p>`;
@@ -1904,8 +1905,12 @@ class TikomPanel extends HTMLElement {
     const s = this.snap, cal = s.calibration;
     const rec = s.recording;
     const docked = this.vacState() === "docked";
+    const dockNote = docked
+      ? `<div class="notice" style="margin-bottom:12px">Der Roboter steht auf der Station. Dort hat er Fahrbefehle bisher nicht angenommen. Heb ihn herunter oder lass ihn selbst herausfahren: Er startet kurz eine Reinigung, bis er die Station verlassen hat, und hält dann an.
+          <div style="margin-top:8px"><button class="btn" data-act="undock" ${s.job.running ? "disabled" : ""}>Aus der Station fahren</button></div></div>`
+      : "";
     return `<div class="grid"><div>
-      <div class="card"><h2>Roboter messen</h2>
+      <div class="card"><h2>Roboter messen</h2>${dockNote}
         ${cal.calibrated ? `<div class="notice ok">Gemessen: ${cal.speed_cm_s.toFixed(1)} cm pro Sekunde, ${cal.turn_deg_s.toFixed(0)} Grad pro Sekunde.</div>` : `<div class="notice">Noch nicht gemessen. Ohne Messung gibt es keine Wege aus dem Plan.</div>`}
         <p class="hint" style="margin:10px 0 0">Stelle den Roboter mit Platz vor sich auf den Boden und lege einen Zollstock bereit.</p>
         <h3>1. Geschwindigkeit</h3>
@@ -1920,14 +1925,15 @@ class TikomPanel extends HTMLElement {
           <button class="btn primary" data-act="cal-save-turn">Speichern</button></div>
         <p class="hint" style="margin-top:8px">Ein Viertelkreis sind 90 Grad, eine halbe Drehung 180 Grad.</p></div>
       </div><div>
-      <div class="card"><h2>Von Hand fahren und aufnehmen</h2>
+      <div class="card"><h2>Von Hand fahren und aufnehmen</h2>${dockNote}
         <div class="padgrid"><span class="empty btn"></span><button class="btn" data-act="drive" data-d="forward">Vor</button><span class="empty btn"></span>
           <button class="btn" data-act="drive" data-d="left">Links</button><button class="btn" data-act="drive" data-d="reverse">Zurück</button><button class="btn" data-act="drive" data-d="right">Rechts</button></div>
         <label class="field" style="margin-top:12px">Sekunden pro Tastendruck<input type="number" min="0.5" max="30" step="0.5" value="${esc(s.settings.step_seconds)}" data-change="step-seconds"></label>
+        <p class="hint" style="margin-top:6px">Links und Rechts drehen so lange, wie hier steht. Für kleine Drehungen kürzer einstellen (zum Beispiel 0,5).</p>
         <h3>Aufnahme</h3>
         <p class="num" style="word-break:break-all">${rec ? esc(rec) : `<span class="hint">Noch leer. Jeder Tastendruck wird hier festgehalten.</span>`}</p>
         <div class="row" style="margin-top:10px"><button class="btn" data-act="rec" data-r="clear" ${rec ? "" : "disabled"}>Leeren</button>
-          <button class="btn" data-act="rec" data-r="test" ${rec && docked ? "" : "disabled"}>Abspielen</button></div>
+          <button class="btn" data-act="rec" data-r="test" ${rec && !s.job.running ? "" : "disabled"}>Abspielen</button></div>
         <div class="row" style="margin-top:10px"><input type="text" id="recname" placeholder="Als Raum speichern, z. B. Bad" maxlength="40" style="flex:1" value="${esc(this.recName)}"><button class="btn primary" data-act="rec-save" ${rec ? "" : "disabled"}>Speichern</button></div>
         <p class="hint" style="margin-top:8px">Gelb gestrichelt zeigt der Plan (Reiter „Plan“ oder „Übersicht“), wo die Aufnahme enden sollte. Damit kannst du Wege auch dort festlegen, wo der Plan keinen findet.</p></div>
       </div></div>`;
@@ -1958,6 +1964,13 @@ class TikomPanel extends HTMLElement {
         <p class="hint">Der Plan kennt deine Teppiche und umgeht sie auf dem Weg. Im Raum fährt der Roboter selbst. Erkennt seine eigene Teppicherkennung (oben) den Teppich nicht, hilft nur, in diesen Räumen nicht zu wischen.</p>
         <label class="toggle"><span>Prüfen, ob er die Station verlassen hat</span><input type="checkbox" data-change="bool-setting" data-key="verify_leave_dock" ${this.snap.settings.verify_leave_dock ? "checked" : ""}></label>
         <p class="hint">Nach dem ersten Fahrschritt muss der Roboter sich von „An der Station“ lösen. Sonst bricht der Auftrag ab, statt an der Station zu reinigen.</p>
+        <label class="field">Wie fährt er aus der Station los?
+          <select data-change="setting-str" data-key="undock_mode">
+            <option value="clean_start" ${(this.snap.settings.undock_mode || "clean_start") === "clean_start" ? "selected" : ""}>Reinigung starten, bis er draußen ist, dann anhalten</option>
+            <option value="drive" ${this.snap.settings.undock_mode === "drive" ? "selected" : ""}>Fahrbefehle direkt senden</option></select></label>
+        <label class="field">Sekunden weiterfahren, nachdem er die Station verlassen hat
+          <input type="number" min="0" max="15" step="0.5" value="${esc(this.snap.settings.undock_seconds ?? 2)}" data-change="setting-num" data-key="undock_seconds"></label>
+        <p class="hint">Auf der Station hat der Roboter Fahrbefehle bisher nicht angenommen. Beim ersten Weg startet er deshalb selbst eine Reinigung, verlässt damit die Station und wird nach der eingestellten Zeit angehalten. Danach fährt er die Route. Wo genau er dann steht, kann der Plan nicht wissen: Prüfe das mit „Nur hinfahren (Test)“.</p>
         <label class="toggle"><span>Fahrbefehl jede Sekunde wiederholen</span><input type="checkbox" data-change="bool-setting" data-key="repeat_drive" ${this.snap.settings.repeat_drive ? "checked" : ""}></label>
         <p class="hint">Zum Ausprobieren, wenn der Roboter einen Fahrschritt nicht bis zum Ende ausführt. Laut der Tuya-Entwicklerdokumentation bewegt sich ein Roboter in der App, solange die Richtungstaste gehalten wird. Ob dein Roboter einen wiederholten Befehl braucht, ist nicht belegt.</p></div></div></div></div>`;
   }
@@ -2491,6 +2504,7 @@ Object.assign(TikomPanel.prototype, {
       case "mode": await this.act("setting", { key: "clean_mode", value: t.dataset.mode }); break;
       case "clean": await this.act("clean", { rooms: [...this.sel], mode: s.settings.clean_mode, skip_drive: !!this.skipDrive && this.sel.size === 1 }, "Los geht's"); break;
       case "dry": await this.act("clean", { rooms: [[...this.sel][0]], dry_run: true }, "Testfahrt gestartet"); break;
+      case "undock": await this.act("undock", {}, "Fährt aus der Station"); break;
       case "abort": await this.act("abort", {}, "Abgebrochen"); break;
       case "err-ok": this.errDismissed = JSON.stringify(s.last_run); this._render(); break;
       case "carpet-only-on": await this.act("setting", { key: "carpet_sweep_only", value: true }, "Räume mit Teppich werden nur gesaugt"); break;
@@ -2652,6 +2666,8 @@ Object.assign(TikomPanel.prototype, {
       case "room-color": await this.act("room", { action: "update", room_id: t.dataset.room, color: t.value }); break;
       case "room-minutes": await this.act("room", { action: "update", room_id: t.dataset.room, minutes: Number(t.value) }); break;
       case "room-src": await this.act("room", { action: "update", room_id: t.dataset.room, use_recorded: t.value === "rec" }); break;
+      case "setting-str": await this.act("setting", { key: t.dataset.key, value: t.value }); break;
+      case "setting-num": { const v = Number(t.value); if (Number.isFinite(v)) await this.act("setting", { key: t.dataset.key, value: v }); break; }
       case "step-seconds": await this.act("setting", { key: "step_seconds", value: Number(t.value) }); break;
       case "bool-setting": await this.act("setting", { key: t.dataset.key, value: t.checked }); break;
       case "skip-drive": this.skipDrive = t.checked; this._render(); break;

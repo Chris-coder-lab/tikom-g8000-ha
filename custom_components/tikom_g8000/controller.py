@@ -52,6 +52,11 @@ CLEAN_MODES = ("sweep", "mop", "sweep_and_mop")
 REJECTED_KEEP = 5
 TRACE_MAX = 60
 REPEAT_INTERVAL = 1.0  # seconds between repeated direction commands
+WATCH_INTERVAL = 0.25  # how often a drive step looks at the robot
+UNDOCK_WAIT = 25  # seconds the robot has to leave the station after a start command
+UNDOCK_STOP_WAIT = 10  # seconds the robot has to stop after the stop command
+DEFAULT_UNDOCK_SECONDS = 2.0  # keeps driving this long after it left the station
+UNDOCK_MODES = ("clean_start", "drive")
 START_MODE_KEYS = ("clean", "wall_follow", "random")
 BOOL_SETTINGS = ("verify_leave_dock", "carpet_sweep_only", "repeat_drive")
 EXPORT_FORMAT = "tikom_g8000_export"
@@ -66,6 +71,8 @@ EXPORT_SETTINGS = (
     "verify_leave_dock",
     "carpet_sweep_only",
     "repeat_drive",
+    "undock_mode",
+    "undock_seconds",
 )
 FEEDBACK_STEP = 0.05
 # Suffix of the Tuya Local unique_id ("<device>-<config_id>") for every tile
@@ -99,11 +106,15 @@ def clean_setting(key: str, value: Any) -> Any:
         if value not in START_MODE_KEYS:
             raise HomeAssistantError("Unbekannter Modus.")
         return value
+    if key == "undock_mode":
+        if value not in UNDOCK_MODES:
+            raise HomeAssistantError("Unbekannte Art, die Station zu verlassen.")
+        return value
     if key in BOOL_SETTINGS:
         if not isinstance(value, bool):
             raise HomeAssistantError("Ungültiger Wert (an oder aus).")
         return value
-    if key in ("min_battery", "step_seconds"):
+    if key in ("min_battery", "step_seconds", "undock_seconds"):
         if isinstance(value, bool):
             raise HomeAssistantError("Ungültiger Zahlenwert.")
         try:
@@ -114,6 +125,8 @@ def clean_setting(key: str, value: Any) -> Any:
             raise HomeAssistantError("Ungültiger Zahlenwert.")
         if key == "min_battery":
             return min(max(number, 20.0), 100.0)
+        if key == "undock_seconds":
+            return min(max(number, 0.0), 15.0)
         return min(max(number, 0.5), 30.0)
     raise HomeAssistantError("Unbekannte Einstellung.")
 
@@ -225,6 +238,8 @@ class Controller:
             "verify_leave_dock": True,
             "carpet_sweep_only": False,
             "repeat_drive": False,
+            "undock_mode": "clean_start",
+            "undock_seconds": DEFAULT_UNDOCK_SECONDS,
         }
         settings.update(stored.get("settings", {}))
         calibration = {"speed_cm_s": 25.0, "turn_deg_s": 60.0, "calibrated": False}
@@ -1033,6 +1048,7 @@ class Controller:
                 "queue": self.queue,
                 "phase": self.phase,
                 "mode": self.job_mode,
+                "trace": list(self._trace) if self.job_running else [],
             },
             "last_run": self.last_run,
         }
@@ -1098,6 +1114,7 @@ class Controller:
         """One line in the log of the current job (shown in the panel after a run)."""
         if len(self._trace) < TRACE_MAX:
             self._trace.append(f"{time.monotonic() - self._trace_t0:5.0f} s  {text}")
+            async_dispatcher_send(self.hass, self.signal_update)
 
     def _trace_reset(self) -> None:
         self._trace = []
@@ -1141,17 +1158,22 @@ class Controller:
         async with self._motion_lock:
             try:
                 await self._send("send_command", command=direction)
-                if self.get_setting("repeat_drive"):
-                    # hold the direction like a finger on the button of the app
-                    remaining = duration
-                    while remaining > 0:
-                        chunk = min(REPEAT_INTERVAL, remaining)
-                        await asyncio.sleep(chunk)
-                        remaining -= chunk
-                        if remaining > 0.05:
-                            await self._send("send_command", command=direction)
-                else:
-                    await asyncio.sleep(duration)
+                repeat = bool(self.get_setting("repeat_drive"))
+                remaining, since_repeat = duration, 0.0
+                while remaining > 0:
+                    chunk = min(WATCH_INTERVAL, remaining)
+                    await asyncio.sleep(chunk)
+                    remaining -= chunk
+                    since_repeat += chunk
+                    if self.vacuum_state() == "error":
+                        raise HomeAssistantError(
+                            "Der Roboter meldet einen Fehler und wurde angehalten "
+                            "(zum Beispiel festgefahren oder hochgehoben)."
+                        )
+                    if repeat and since_repeat >= REPEAT_INTERVAL and remaining > 0.05:
+                        # hold the direction like a finger on the button of the app
+                        await self._send("send_command", command=direction)
+                        since_repeat = 0.0
             finally:
                 await self._send("send_command", command="stop")
         if record:
@@ -1184,6 +1206,7 @@ class Controller:
                 f"Roboter: {self._robot_report()}"
             )
             await self.async_drive(direction, seconds, record=False)
+            self._trace_add(f"Schritt {number}/{total} gesendet, Roboter: {self._robot_report()}")
             if not checked and direction in ("forward", "reverse"):
                 checked = True
                 left = await self._wait_for(
@@ -1201,11 +1224,80 @@ class Controller:
                     )
             await asyncio.sleep(0.7)
 
+    async def async_undock(self) -> None:
+        """Get the robot off the station with the robot's own cleaning start.
+
+        On the station the robot ignores drive commands. A cleaning start makes it
+        leave the station by itself; as soon as it reports something other than
+        "docked" it keeps going for undock_seconds, then it is stopped. After that
+        it stands on the floor, where drive commands work.
+        """
+        if self.vacuum_state() != "docked":
+            return
+        mode = self.get_setting("start_mode")
+        self._trace_add(f"Verlasse die Station: Reinigungsstart „{mode}“, Roboter: {self._robot_report()}")
+        await self._send("send_command", command=mode)
+        try:
+            left = await self._wait_for(lambda: self.vacuum_state() != "docked", UNDOCK_WAIT)
+            self._trace_add(f"Nach dem Start, Roboter: {self._robot_report()}")
+            if not left:
+                raise HomeAssistantError(
+                    f"Der Roboter hat die Station auch {UNDOCK_WAIT} Sekunden nach dem "
+                    "Start einer Reinigung nicht verlassen. Er steht vielleicht nicht "
+                    "richtig auf der Station oder die Reinigung startet nicht."
+                )
+            await asyncio.sleep(float(self.get_setting("undock_seconds")))
+        finally:
+            await self._send("stop")
+        stopped = await self._wait_for(lambda: self.vacuum_state() != "cleaning", UNDOCK_STOP_WAIT)
+        self._trace_add(f"Nach dem Anhalten, Roboter: {self._robot_report()}")
+        if not stopped:
+            await self._send("return_to_base")
+            raise HomeAssistantError(
+                "Der Roboter hat auf das Anhalten nicht reagiert und fährt zur Station zurück."
+            )
+        await asyncio.sleep(1.0)
+
+    @callback
+    def start_undock(self) -> None:
+        """Take the robot off the station (for driving by hand, recording)."""
+        if self.job_running:
+            raise HomeAssistantError("Es läuft bereits ein Auftrag.")
+        if self.vacuum_state() != "docked":
+            raise HomeAssistantError("Der Roboter steht nicht auf der Station.")
+        self.last_run = None
+        self.queue = []
+        self._job = self.hass.async_create_background_task(
+            self._run_undock(), name=f"{DOMAIN} undock"
+        )
+
+    async def _run_undock(self) -> None:
+        self._trace_reset()
+        self._set_phase("Fahre aus der Station")
+        try:
+            await self.async_undock()
+        except asyncio.CancelledError:
+            raise
+        except HomeAssistantError as err:
+            self._notify("Tikom: Aus der Station fahren", str(err))
+            self.last_run = {
+                "room": None, "ok": False, "error": str(err),
+                "ts": time.time(), "trace": list(self._trace),
+            }
+        finally:
+            self.phase = ""
+            async_dispatcher_send(self.hass, self.signal_update)
+
     async def async_test_recording(self) -> None:
         """Drive the current recording."""
         steps = parse_route(self.recording)
         if not steps:
             raise HomeAssistantError("Die Aufnahme ist leer.")
+        if self.job_running:
+            raise HomeAssistantError("Es läuft bereits ein Auftrag.")
+        undock = self.get_setting("undock_mode") == "clean_start" and self.vacuum_state() == "docked"
+        if undock:
+            await self.async_undock()
         await self.async_run_steps(steps)
 
     @callback
@@ -1365,6 +1457,14 @@ class Controller:
                 self._notify(title, f"Der Akku hat {minimum:.0f} % nicht erreicht.")
                 raise HomeAssistantError("Der Akku hat die Mindestladung nicht erreicht.")
 
+        undock = self.get_setting("undock_mode") == "clean_start"
+        if undock:
+            self._set_phase("Fahre aus der Station")
+            try:
+                await self.async_undock()
+            except HomeAssistantError as err:
+                self._notify(title, str(err))
+                raise
         steps = route["steps"]
         self._set_phase(
             f"Fahre zum Raum ({len(steps)} Schritte, "
@@ -1373,7 +1473,7 @@ class Controller:
         try:
             await self.async_run_steps(
                 steps,
-                verify_leave=bool(self.get_setting("verify_leave_dock")),
+                verify_leave=bool(self.get_setting("verify_leave_dock")) and not undock,
                 report=True,
             )
         except HomeAssistantError as err:
