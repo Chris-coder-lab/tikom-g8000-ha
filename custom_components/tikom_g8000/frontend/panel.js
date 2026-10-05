@@ -62,6 +62,8 @@ button { cursor: pointer; }
 .dot.cleaning, .dot.returning { background: var(--tk-ok); box-shadow: 0 0 0 4px rgba(63,178,127,.2); }
 .dot.docked { background: var(--tk-accent); }
 .dot.error { background: var(--tk-bad); }
+.trace { margin: 6px 0 0; padding: 8px; border-radius: 8px; background: rgba(127,127,127,.14); font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-x: auto; }
+details > summary { cursor: pointer; font-size: 13px; }
 .bolt { width: 1em; height: 1em; fill: var(--tk-ok); vertical-align: -0.14em; flex: none; }
 .bolt.full { fill: none; color: var(--tk-ok); }
 .chg { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 500; color: var(--tk-ok); margin-left: 6px; vertical-align: middle; }
@@ -1779,6 +1781,11 @@ class TikomPanel extends HTMLElement {
       </div><div>${this._actionCard()}${this._setupCard()}${this._feedbackCard()}${this._quickCard()}</div></div></div>`;
   }
 
+  _traceHtml(lr) {
+    if (!lr?.trace?.length) return "";
+    return `<details style="margin-top:8px"><summary>Verlauf des Auftrags</summary><pre class="trace">${esc(lr.trace.join("\n"))}</pre></details>`;
+  }
+
   _wrongFloor() {
     const s = this.snap;
     if (s.floors.length < 2 || !s.robot_floor) return null;
@@ -1806,7 +1813,14 @@ class TikomPanel extends HTMLElement {
          Trage den Roboter dorthin, stelle ihn auf die Station und tippe dann hier:
          <div style="margin-top:8px"><button class="btn" data-act="robot-here" data-floor="${esc(wrong)}">Roboter steht jetzt im Stockwerk „${esc(this.floorName(wrong))}“</button></div></div>`
       : "";
-    const ok = picked.length && docked && !this.preview?.error && !wrong;
+    const skip = !!this.skipDrive && picked.length === 1;
+    const ok = skip
+      ? this.vacState() !== "cleaning"
+      : picked.length && docked && !this.preview?.error && !wrong;
+    const skipHtml = picked.length === 1
+      ? `<label class="toggle" style="margin-top:12px"><span>Roboter steht schon im Raum, nicht anfahren</span><input type="checkbox" data-change="skip-drive" ${skip ? "checked" : ""}></label>
+         ${skip ? `<p class="hint">Der Roboter fährt nicht los, sondern fängt dort an, wo er jetzt steht, und kehrt danach zur Station zurück. Stelle ihn vorher in den Raum.</p>` : ""}`
+      : "";
     const carpetRooms = [...this.sel].filter((id) => s.rooms[id]?.has_carpet).map((id) => s.rooms[id].name);
     let carpetHtml = "";
     if (carpetRooms.length && mode !== "sweep") {
@@ -1818,15 +1832,17 @@ class TikomPanel extends HTMLElement {
     const lr = s.last_run;
     const errHtml = lr && lr.error && this.errDismissed !== JSON.stringify(lr)
       ? `<div class="notice bad" style="margin-top:10px"><b>Letzter Auftrag${lr.room && s.rooms[lr.room] ? ` (${esc(s.rooms[lr.room].name)})` : ""} abgebrochen:</b> ${esc(lr.error)}
+         ${this._traceHtml(lr)}
          <div style="margin-top:8px"><button class="btn" data-act="err-ok">Okay</button></div></div>`
       : "";
     return `<div class="card"><h2>Reinigen</h2>
       <p style="margin-bottom:10px">${picked.length ? esc(picked.join(", ")) : "Kein Raum gewählt"}</p>
       <div class="seg full" style="margin-bottom:12px">${Object.entries(MODE_TEXT).map(([k, t]) => `<button data-act="mode" data-mode="${k}" aria-pressed="${mode === k}">${t}</button>`).join("")}</div>
-      ${info}${wrongHtml}${carpetHtml}${errHtml}
-      ${docked ? "" : `<div class="notice" style="margin-top:10px">Der Roboter muss auf der Station stehen, sonst startet kein Raumauftrag.</div>`}
+      ${skip ? "" : info}${skip ? "" : wrongHtml}${carpetHtml}${errHtml}
+      ${skipHtml}
+      ${docked || skip ? "" : `<div class="notice" style="margin-top:10px">Der Roboter muss auf der Station stehen, sonst startet kein Raumauftrag.</div>`}
       <div class="row" style="margin-top:12px"><button class="btn primary big" data-act="clean" ${ok ? "" : "disabled"}>Los</button></div>
-      <div class="row" style="margin-top:8px"><button class="btn" data-act="dry" ${ok ? "" : "disabled"}>Nur hinfahren (Test)</button></div></div>`;
+      <div class="row" style="margin-top:8px"><button class="btn" data-act="dry" ${ok && !skip ? "" : "disabled"}>Nur hinfahren (Test)</button></div></div>`;
   }
 
   _setupCard() {
@@ -1850,6 +1866,7 @@ class TikomPanel extends HTMLElement {
     const key = JSON.stringify(lr);
     if (this.fbDismissed === key) return "";
     return `<div class="card"><h2>Wie genau war die Fahrt?</h2><p class="hint" style="margin-bottom:10px">Jede Rückmeldung verbessert die Messwerte um 5 Prozent.</p>
+      ${this._traceHtml(lr)}
       <div class="row">
         <button class="btn" data-act="fb" data-kind="too_short">Zu kurz</button>
         <button class="btn" data-act="fb" data-kind="too_long">Zu weit</button>
@@ -1940,7 +1957,9 @@ class TikomPanel extends HTMLElement {
         <label class="toggle"><span>Räume mit Teppich nur saugen</span><input type="checkbox" data-change="bool-setting" data-key="carpet_sweep_only" ${this.snap.settings.carpet_sweep_only ? "checked" : ""}></label>
         <p class="hint">Der Plan kennt deine Teppiche und umgeht sie auf dem Weg. Im Raum fährt der Roboter selbst. Erkennt seine eigene Teppicherkennung (oben) den Teppich nicht, hilft nur, in diesen Räumen nicht zu wischen.</p>
         <label class="toggle"><span>Prüfen, ob er die Station verlassen hat</span><input type="checkbox" data-change="bool-setting" data-key="verify_leave_dock" ${this.snap.settings.verify_leave_dock ? "checked" : ""}></label>
-        <p class="hint">Nach dem ersten Fahrschritt muss der Roboter sich von „An der Station“ lösen. Sonst bricht der Auftrag ab, statt an der Station zu reinigen.</p></div></div></div></div>`;
+        <p class="hint">Nach dem ersten Fahrschritt muss der Roboter sich von „An der Station“ lösen. Sonst bricht der Auftrag ab, statt an der Station zu reinigen.</p>
+        <label class="toggle"><span>Fahrbefehl jede Sekunde wiederholen</span><input type="checkbox" data-change="bool-setting" data-key="repeat_drive" ${this.snap.settings.repeat_drive ? "checked" : ""}></label>
+        <p class="hint">Zum Ausprobieren, wenn der Roboter einen Fahrschritt nicht bis zum Ende ausführt. Laut der Tuya-Entwicklerdokumentation bewegt sich ein Roboter in der App, solange die Richtungstaste gehalten wird. Ob dein Roboter einen wiederholten Befehl braucht, ist nicht belegt.</p></div></div></div></div>`;
   }
 }
 
@@ -2470,7 +2489,7 @@ Object.assign(TikomPanel.prototype, {
       case "svc": this.svc("vacuum", t.dataset.s, { entity_id: s.vacuum }); break;
       case "sel": this._toggleRoom(t.dataset.room); break;
       case "mode": await this.act("setting", { key: "clean_mode", value: t.dataset.mode }); break;
-      case "clean": await this.act("clean", { rooms: [...this.sel], mode: s.settings.clean_mode }, "Los geht's"); break;
+      case "clean": await this.act("clean", { rooms: [...this.sel], mode: s.settings.clean_mode, skip_drive: !!this.skipDrive && this.sel.size === 1 }, "Los geht's"); break;
       case "dry": await this.act("clean", { rooms: [[...this.sel][0]], dry_run: true }, "Testfahrt gestartet"); break;
       case "abort": await this.act("abort", {}, "Abgebrochen"); break;
       case "err-ok": this.errDismissed = JSON.stringify(s.last_run); this._render(); break;
@@ -2635,6 +2654,7 @@ Object.assign(TikomPanel.prototype, {
       case "room-src": await this.act("room", { action: "update", room_id: t.dataset.room, use_recorded: t.value === "rec" }); break;
       case "step-seconds": await this.act("setting", { key: "step_seconds", value: Number(t.value) }); break;
       case "bool-setting": await this.act("setting", { key: t.dataset.key, value: t.checked }); break;
+      case "skip-drive": this.skipDrive = t.checked; this._render(); break;
       case "import-file": this._readImport(t.files?.[0]); t.value = ""; break;
       case "cal-sec-speed": this.calSeconds.speed = clamp(Number(t.value) || 5, 1, 30); break;
       case "cal-sec-turn": this.calSeconds.turn = clamp(Number(t.value) || 3, 1, 30); break;
@@ -2704,5 +2724,5 @@ Object.assign(TikomPanel.prototype, {
   },
 });
 
-customElements.define("tikom-g8000-panel", TikomPanel);
+if (!customElements.get("tikom-g8000-panel")) customElements.define("tikom-g8000-panel", TikomPanel);
 

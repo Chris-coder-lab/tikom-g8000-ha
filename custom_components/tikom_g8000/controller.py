@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import math
 import os
@@ -48,8 +49,11 @@ _LOGGER = logging.getLogger(__name__)
 
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 CLEAN_MODES = ("sweep", "mop", "sweep_and_mop")
+REJECTED_KEEP = 5
+TRACE_MAX = 60
+REPEAT_INTERVAL = 1.0  # seconds between repeated direction commands
 START_MODE_KEYS = ("clean", "wall_follow", "random")
-BOOL_SETTINGS = ("verify_leave_dock", "carpet_sweep_only")
+BOOL_SETTINGS = ("verify_leave_dock", "carpet_sweep_only", "repeat_drive")
 EXPORT_FORMAT = "tikom_g8000_export"
 EXPORT_VERSION = 1
 # settings that travel with an export (selected_room is only a UI memory)
@@ -61,6 +65,7 @@ EXPORT_SETTINGS = (
     "robot_floor",
     "verify_leave_dock",
     "carpet_sweep_only",
+    "repeat_drive",
 )
 FEEDBACK_STEP = 0.05
 # Suffix of the Tuya Local unique_id ("<device>-<config_id>") for every tile
@@ -197,6 +202,8 @@ class Controller:
         self.phase: str = ""
         self.job_mode: str = "sweep_and_mop"
         self.last_run: dict[str, Any] | None = None
+        self._trace: list[str] = []
+        self._trace_t0 = time.monotonic()
 
         self.signal_update = f"{DOMAIN}_update_{entry.entry_id}"
         self.signal_room_added = f"{DOMAIN}_room_added_{entry.entry_id}"
@@ -208,6 +215,7 @@ class Controller:
     async def async_load(self) -> None:
         """Load stored data and fill in defaults."""
         stored = await self._store.async_load() or {}
+        await self._backup_before_update(stored)
         settings = {
             "step_seconds": DEFAULT_STEP_SECONDS,
             "min_battery": DEFAULT_MIN_BATTERY,
@@ -216,6 +224,7 @@ class Controller:
             "clean_mode": "sweep_and_mop",
             "verify_leave_dock": True,
             "carpet_sweep_only": False,
+            "repeat_drive": False,
         }
         settings.update(stored.get("settings", {}))
         calibration = {"speed_cm_s": 25.0, "turn_deg_s": 60.0, "calibrated": False}
@@ -232,12 +241,22 @@ class Controller:
                 "use_recorded": bool(room.get("use_recorded", False)),
             }
         floors: list[dict[str, Any]] = []
+        # Floors that cannot be read are never thrown away: the raw data is kept
+        # in the store (and in the backup), so a bug can be fixed later.
+        rejected: list[dict[str, Any]] = list(stored.get("rejected_floors", []))[-REJECTED_KEEP:]
         for raw in stored.get("floors", []):
             try:
                 floor = floorplan.clean_floor(raw)
                 floor["image"] = planner.clean_image(raw.get("image"))
-            except planner.PlanError:
-                _LOGGER.warning("Ein gespeichertes Stockwerk ist ungültig und wird ignoriert")
+            except planner.PlanError as err:
+                _LOGGER.warning("Ein gespeichertes Stockwerk kann nicht gelesen werden: %s", err)
+                rejected = (rejected + [{"error": str(err), "floor": raw}])[-REJECTED_KEEP:]
+                self._notify(
+                    "Tikom: Stockwerk nicht lesbar",
+                    f"Ein gespeichertes Stockwerk konnte nicht gelesen werden ({err}). "
+                    "Die Daten sind nicht gelöscht, sondern in der Speicherdatei und in "
+                    "der Sicherung aufgehoben.",
+                )
                 continue
             floors.append(floor)
         if not floors and stored.get("plan"):
@@ -260,10 +279,41 @@ class Controller:
             "new_room_name": stored.get("new_room_name", ""),
             "rooms": rooms,
             "floors": floors,
+            "app_version": VERSION,
+            "rejected_floors": rejected,
         }
         self._compiled: dict[str, dict[str, Any]] = {}
         for room_id in rooms:
             self._ensure_room_identity(room_id)
+
+    async def _backup_before_update(self, stored: dict[str, Any]) -> None:
+        """Keep a copy of the stored data from before this version took over.
+
+        Written once per previous version and never overwritten, so an update
+        cannot destroy the plan: the copy stays in the .storage folder next to
+        the normal data file.
+        """
+        if not (stored.get("floors") or stored.get("rooms") or stored.get("plan")):
+            return
+        old = stored.get("app_version")
+        if old == VERSION:
+            return
+        label = re.sub(r"[^0-9A-Za-z]+", "_", str(old)) if old else "vor_2_2"
+        backup = Store(self.hass, STORAGE_VERSION, f"{DOMAIN}.{self.entry.entry_id}.backup_{label}")
+        try:
+            if await backup.async_load() is None:
+                await backup.async_save(copy.deepcopy(stored))
+                _LOGGER.info("Sicherung der bisherigen Daten angelegt (Version %s)", old or "älter")
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Die Sicherung der bisherigen Daten ist fehlgeschlagen", exc_info=True)
+
+    async def _write_backup(self, label: str, data: dict[str, Any]) -> None:
+        """Overwrite the named safety copy (used before an import replaces everything)."""
+        backup = Store(self.hass, STORAGE_VERSION, f"{DOMAIN}.{self.entry.entry_id}.backup_{label}")
+        try:
+            await backup.async_save(data)
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Die Sicherung ist fehlgeschlagen", exc_info=True)
 
     def _migrate_old_plan(
         self, stored: dict[str, Any], rooms: dict[str, dict[str, Any]]
@@ -916,6 +966,10 @@ class Controller:
         recording = raw.get("recording", "")
         recording = steps_to_string(parse_route(recording)) if isinstance(recording, str) else ""
 
+        self.hass.async_create_background_task(
+            self._write_backup("vor_import", copy.deepcopy(self.data)),
+            name=f"{DOMAIN} backup",
+        )
         old_rooms = set(self.rooms)
         self.data["rooms"] = rooms
         self.data["floors"] = floors
@@ -1032,6 +1086,23 @@ class Controller:
         self.phase = phase
         async_dispatcher_send(self.hass, self.signal_update)
 
+    def _robot_report(self) -> str:
+        """What the vacuum reports right now, for the run log."""
+        state = self.hass.states.get(self.vacuum_id)
+        if state is None:
+            return "nicht erreichbar"
+        status = state.attributes.get("status")
+        return f"{state.state} ({status})" if status else str(state.state)
+
+    def _trace_add(self, text: str) -> None:
+        """One line in the log of the current job (shown in the panel after a run)."""
+        if len(self._trace) < TRACE_MAX:
+            self._trace.append(f"{time.monotonic() - self._trace_t0:5.0f} s  {text}")
+
+    def _trace_reset(self) -> None:
+        self._trace = []
+        self._trace_t0 = time.monotonic()
+
     async def _apply_clean_mode(self, mode: str) -> None:
         """Set sweep / mop / both on the robot (Tuya Local select)."""
         entity_id = self.entity_map().get("mode")
@@ -1070,7 +1141,17 @@ class Controller:
         async with self._motion_lock:
             try:
                 await self._send("send_command", command=direction)
-                await asyncio.sleep(duration)
+                if self.get_setting("repeat_drive"):
+                    # hold the direction like a finger on the button of the app
+                    remaining = duration
+                    while remaining > 0:
+                        chunk = min(REPEAT_INTERVAL, remaining)
+                        await asyncio.sleep(chunk)
+                        remaining -= chunk
+                        if remaining > 0.05:
+                            await self._send("send_command", command=direction)
+                else:
+                    await asyncio.sleep(duration)
             finally:
                 await self._send("send_command", command="stop")
         if record:
@@ -1098,18 +1179,25 @@ class Controller:
         for number, (direction, seconds) in enumerate(steps, 1):
             if report:
                 self._set_phase(f"Fahre zum Raum, Schritt {number} von {total}")
+            self._trace_add(
+                f"Schritt {number}/{total}: {DIRECTIONS[direction][1]} {seconds:.1f} s, "
+                f"Roboter: {self._robot_report()}"
+            )
             await self.async_drive(direction, seconds, record=False)
             if not checked and direction in ("forward", "reverse"):
                 checked = True
-                if not await self._wait_for(
+                left = await self._wait_for(
                     lambda: self.vacuum_state() != "docked", LEAVE_DOCK_WAIT
-                ):
+                )
+                self._trace_add(f"Nach dem ersten Fahrschritt, Roboter: {self._robot_report()}")
+                if not left:
                     raise HomeAssistantError(
                         "Der Roboter hat die Station nicht verlassen: Er meldet auch "
                         f"{LEAVE_DOCK_WAIT} Sekunden nach dem ersten Fahrschritt noch "
                         "„An der Station“. Die Fahrbefehle wurden gesendet, aber er hat "
                         "sich nicht bewegt. Prüfe im Reiter Fahren, ob Vor oder Zurück "
-                        "ihn von der Station wegbewegen."
+                        "ihn von der Station wegbewegen. Unter Zubehör kannst du auch "
+                        "„Fahrbefehl jede Sekunde wiederholen“ ausprobieren."
                     )
             await asyncio.sleep(0.7)
 
@@ -1146,8 +1234,14 @@ class Controller:
             )
 
     @callback
-    def start_rooms(self, room_ids: list[str], mode: str | None = None) -> None:
-        """Clean rooms one after the other in the background."""
+    def start_rooms(
+        self, room_ids: list[str], mode: str | None = None, skip_drive: bool = False
+    ) -> None:
+        """Clean rooms one after the other in the background.
+
+        With skip_drive the robot is not driven anywhere: it stands in the room
+        already (carried there by hand) and starts cleaning right where it is.
+        """
         if self.job_running:
             raise HomeAssistantError(
                 "Es läuft bereits ein Raumauftrag. Erst abbrechen oder abwarten."
@@ -1158,14 +1252,21 @@ class Controller:
         mode = mode or self.get_setting("clean_mode")
         if mode not in CLEAN_MODES:
             raise HomeAssistantError("Unbekannter Modus.")
-        # fail early, before anything moves: every route must be computable
-        for room_id in rooms:
-            self._require_floor(room_id, self.route_for_room(room_id, mode))
+        if skip_drive:
+            if len(rooms) != 1:
+                raise HomeAssistantError("Ohne Anfahrt geht nur ein Raum auf einmal.")
+            if self.vacuum_state() == "cleaning":
+                raise HomeAssistantError("Der Roboter saugt schon.")
+        else:
+            # fail early, before anything moves: every route must be computable
+            for room_id in rooms:
+                self._require_floor(room_id, self.route_for_room(room_id, mode))
         self.last_run = None
         self.job_mode = mode
         self.queue = list(rooms)
         self._job = self.hass.async_create_background_task(
-            self._run_rooms(rooms, mode, dry=False), name=f"{DOMAIN} room job"
+            self._run_rooms(rooms, mode, dry=False, skip_drive=skip_drive),
+            name=f"{DOMAIN} room job",
         )
 
     @callback
@@ -1184,12 +1285,16 @@ class Controller:
             self._run_rooms([room_id], mode, dry=True), name=f"{DOMAIN} dry run"
         )
 
-    async def _run_rooms(self, rooms: list[str], mode: str, dry: bool) -> None:
+    async def _run_rooms(
+        self, rooms: list[str], mode: str, dry: bool, skip_drive: bool = False
+    ) -> None:
+        self._trace_reset()
+        self._trace_add(f"Auftrag gestartet, Roboter: {self._robot_report()}")
         try:
             for room_id in rooms:
                 self.current_room = room_id
                 self._set_phase("Starte")
-                await self._clean_room(room_id, mode, dry)
+                await self._clean_room(room_id, mode, dry, skip_drive)
                 self.queue = [r for r in self.queue if r != room_id]
         except asyncio.CancelledError:
             raise
@@ -1200,6 +1305,7 @@ class Controller:
                 "ok": False,
                 "error": str(err),
                 "ts": time.time(),
+                "trace": list(self._trace),
             }
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Raumauftrag fehlgeschlagen")
@@ -1208,6 +1314,7 @@ class Controller:
                 "ok": False,
                 "error": f"Unerwarteter Fehler: {err}",
                 "ts": time.time(),
+                "trace": list(self._trace),
             }
         finally:
             self.current_room = None
@@ -1215,12 +1322,18 @@ class Controller:
             self.phase = ""
             async_dispatcher_send(self.hass, self.signal_update)
 
-    async def _clean_room(self, room_id: str, mode: str, dry: bool) -> None:
+    async def _clean_room(
+        self, room_id: str, mode: str, dry: bool, skip_drive: bool = False
+    ) -> None:
         room = self.rooms[room_id]
         name = room["name"]
         title = f"Tikom: {name}"
         mode = self.effective_mode(room_id, mode)
         self.job_mode = mode
+
+        if skip_drive:
+            await self._start_cleaning_here(room_id, room, mode, title)
+            return
 
         if self.vacuum_state() != "docked":
             self._notify(
@@ -1274,6 +1387,7 @@ class Controller:
                 "dry": True,
                 "ts": time.time(),
                 "steps": len(steps),
+                "trace": list(self._trace),
             }
             self._notify(
                 title,
@@ -1282,10 +1396,18 @@ class Controller:
             )
             return
 
+        await self._start_cleaning_here(room_id, room, mode, title, len(steps))
+
+    async def _start_cleaning_here(
+        self, room_id: str, room: dict[str, Any], mode: str, title: str, steps: int = 0
+    ) -> None:
+        """Start cleaning where the robot stands, wait for the end, send it home."""
         await self._apply_clean_mode(mode)
         self._set_phase("Reinige")
+        self._trace_add(f"Starte Reinigung, Roboter: {self._robot_report()}")
         await self._send("send_command", command=self.get_setting("start_mode"))
         await asyncio.sleep(START_CHECK_DELAY)
+        self._trace_add(f"{START_CHECK_DELAY} s nach dem Start, Roboter: {self._robot_report()}")
         if self.vacuum_state() != "cleaning":
             await self._send("return_to_base")
             self._notify(
@@ -1314,7 +1436,8 @@ class Controller:
             "ok": True,
             "dry": False,
             "ts": time.time(),
-            "steps": len(steps),
+            "steps": steps,
+            "trace": list(self._trace),
         }
 
     def _cancel_job(self) -> None:

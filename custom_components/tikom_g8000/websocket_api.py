@@ -163,6 +163,7 @@ async def ws_preview(hass, c, msg):
         vol.Required("rooms"): vol.All([ROOM_ID], vol.Length(min=1, max=35)),
         vol.Optional("mode"): MODE,
         vol.Optional("dry_run", default=False): bool,
+        vol.Optional("skip_drive", default=False): bool,
     }
 )
 async def ws_clean(hass, c, msg):
@@ -170,7 +171,7 @@ async def ws_clean(hass, c, msg):
     if msg["dry_run"]:
         c.start_dry_run(msg["rooms"][0])
     else:
-        c.start_rooms(msg["rooms"], msg.get("mode"))
+        c.start_rooms(msg["rooms"], msg.get("mode"), skip_drive=msg["skip_drive"])
     return {}
 
 
@@ -267,6 +268,7 @@ async def ws_calibration(hass, c, msg):
                 "step_seconds",
                 "verify_leave_dock",
                 "carpet_sweep_only",
+                "repeat_drive",
             ]
         ),
         vol.Required("value"): vol.Any(str, int, float, bool),
