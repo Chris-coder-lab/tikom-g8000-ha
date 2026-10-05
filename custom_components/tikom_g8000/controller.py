@@ -151,6 +151,44 @@ def parse_route(route: str | None) -> list[tuple[str, float]]:
     return steps[: planner.MAX_STEPS * 2]
 
 
+def parse_route_strict(text: str) -> list[tuple[str, float]]:
+    """Read a typed route like "b2.5,l1.5,f5.5"; raise a clear error for a bad step.
+
+    f = forward, b = reverse, l = left, r = right, followed by the seconds
+    (decimal point). Steps are separated by commas, semicolons or line breaks.
+    """
+    if not isinstance(text, str):
+        raise HomeAssistantError("Die Route muss ein Text sein.")
+    steps: list[tuple[str, float]] = []
+    for raw in re.split(r"[,;\n]+", text):
+        token = raw.strip().lower().replace(" ", "")
+        if not token:
+            continue
+        example = "Beispiel: b2.5,l1.5,f5.5"
+        if token[0] not in CODE_TO_DIRECTION:
+            raise HomeAssistantError(
+                f"„{raw.strip()}“ ist kein Schritt. Erlaubt sind f (vor), b (zurück), "
+                f"l (links) und r (rechts), danach die Sekunden. {example}"
+            )
+        try:
+            seconds = float(token[1:])
+        except ValueError:
+            raise HomeAssistantError(
+                f"„{raw.strip()}“: Nach dem Buchstaben fehlt die Zahl der Sekunden "
+                f"(mit Punkt, zum Beispiel 2.5). {example}"
+            ) from None
+        if not 0 < seconds <= planner.MAX_STEP_SECONDS:
+            raise HomeAssistantError(
+                f"„{raw.strip()}“: Ein Schritt dauert höchstens {planner.MAX_STEP_SECONDS:g} Sekunden."
+            )
+        steps.append((CODE_TO_DIRECTION[token[0]], round(seconds, 1) or 0.1))
+    if len(steps) > planner.MAX_STEPS * 2:
+        raise HomeAssistantError(f"Höchstens {planner.MAX_STEPS * 2} Schritte.")
+    if len(steps_to_string(steps)) > MAX_ROUTE_LENGTH:
+        raise HomeAssistantError(f"Die Route ist zu lang (höchstens {MAX_ROUTE_LENGTH} Zeichen).")
+    return steps
+
+
 def format_step(direction: str, seconds: float) -> str:
     """Format one route step, e.g. ("left", 1.2) -> "l1.2"."""
     return f"{DIRECTIONS[direction][0]}{seconds:.1f}"
@@ -1299,6 +1337,11 @@ class Controller:
         if undock:
             await self.async_undock()
         await self.async_run_steps(steps)
+
+    @callback
+    def set_recording_text(self, text: str) -> None:
+        """Replace the recording by a typed route (checked, rounded to 0.1 s)."""
+        self.set_recording(steps_to_string(parse_route_strict(text)))
 
     @callback
     def clear_recording(self) -> None:

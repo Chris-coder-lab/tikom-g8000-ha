@@ -206,7 +206,8 @@ async def ws_drive(hass, c, msg):
 @_command(
     {
         vol.Required("type"): f"{DOMAIN}/recording",
-        vol.Required("action"): vol.In(["clear", "test", "save_as_room", "save_to_room"]),
+        vol.Required("action"): vol.In(["clear", "test", "set", "save_as_room", "save_to_room"]),
+        vol.Optional("route"): vol.All(str, vol.Length(max=1000)),
         vol.Optional("name"): NAME,
         vol.Optional("room_id"): ROOM_ID,
     }
@@ -216,6 +217,10 @@ async def ws_recording(hass, c, msg):
     action = msg["action"]
     if action == "clear":
         c.clear_recording()
+    elif action == "set":
+        if "route" not in msg:
+            raise HomeAssistantError("Die Route fehlt.")
+        c.set_recording_text(msg["route"])
     elif action == "test":
         await c.async_test_recording()
     elif action == "save_as_room":

@@ -34,7 +34,7 @@ const STYLE = `
 * { box-sizing: border-box; }
 .wrap { max-width: 1180px; margin: 0 auto; padding: 16px 16px 48px; }
 h1, h2, h3, p { margin: 0; }
-button, input, select { font: inherit; color: inherit; }
+button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 :focus-visible { outline: 2px solid var(--tk-accent); outline-offset: 2px; }
 
@@ -117,7 +117,7 @@ canvas { display: block; width: 100%; touch-action: none; }
 .roomrow { display: grid; grid-template-columns: 30px 1fr 74px auto; gap: 8px; align-items: center; padding: 6px; border-radius: 10px; border: 1px solid transparent; }
 .roomrow.active { border-color: var(--tk-accent); background: color-mix(in srgb, var(--tk-accent) 10%, transparent); }
 .roomrow input[type=color] { width: 30px; height: 30px; padding: 0; border: 0; background: none; border-radius: 8px; }
-input[type=text], input[type=number], select { background: transparent; border: 1px solid var(--tk-line); border-radius: 9px; padding: 8px 10px; min-width: 0; width: 100%; }
+input[type=text], input[type=number], select, textarea { background: transparent; border: 1px solid var(--tk-line); border-radius: 9px; padding: 8px 10px; min-width: 0; width: 100%; box-sizing: border-box; resize: vertical; }
 select option { background: var(--tk-card); color: var(--primary-text-color, #eee); }
 input[type=range] { width: 100%; accent-color: var(--tk-accent); }
 label.field { display: grid; gap: 4px; font-size: 13px; color: var(--tk-soft); }
@@ -1786,6 +1786,15 @@ class TikomPanel extends HTMLElement {
     return `<details style="margin-top:8px"><summary>Verlauf des Auftrags</summary><pre class="trace">${esc(lr.trace.join("\n"))}</pre></details>`;
   }
 
+  _routeWords(text) {
+    const names = { f: "vor", b: "zurück", l: "links", r: "rechts" };
+    const steps = String(text || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean)
+      .map((t) => ({ d: names[t[0]], s: parseFloat(t.slice(1)) })).filter((x) => x.d && x.s > 0);
+    if (!steps.length) return "Noch keine Route.";
+    const total = steps.reduce((a, x) => a + x.s, 0);
+    return `${steps.map((x) => `${x.d} ${String(x.s).replace(".", ",")} s`).join(", dann ")}. Zusammen ${total.toFixed(1).replace(".", ",")} Sekunden.`;
+  }
+
   _wrongFloor() {
     const s = this.snap;
     if (s.floors.length < 2 || !s.robot_floor) return null;
@@ -1931,7 +1940,11 @@ class TikomPanel extends HTMLElement {
         <label class="field" style="margin-top:12px">Sekunden pro Tastendruck<input type="number" min="0.5" max="30" step="0.5" value="${esc(s.settings.step_seconds)}" data-change="step-seconds"></label>
         <p class="hint" style="margin-top:6px">Links und Rechts drehen so lange, wie hier steht. Für kleine Drehungen kürzer einstellen (zum Beispiel 0,5).</p>
         <h3>Aufnahme</h3>
-        <p class="num" style="word-break:break-all">${rec ? esc(rec) : `<span class="hint">Noch leer. Jeder Tastendruck wird hier festgehalten.</span>`}</p>
+        <label class="field">Route (jeder Tastendruck wird hier festgehalten, du kannst sie auch eintippen)
+          <textarea id="routetext" rows="2" spellcheck="false" autocapitalize="off" placeholder="z. B. b2.5,l1.5,f5.5" style="font-family:ui-monospace,Menlo,Consolas,monospace">${esc(rec)}</textarea></label>
+        <p class="hint" style="margin-top:6px">f = vor, b = zurück, l = links, r = rechts, danach die Sekunden mit Punkt. Schritte mit Komma trennen. „b2.5,l1.5,f5.5“ heißt: 2,5 s zurück, 1,5 s links, 5,5 s vor.</p>
+        <p class="hint" style="margin-top:6px">${esc(this._routeWords(rec))}</p>
+        <div class="row" style="margin-top:8px"><button class="btn primary" data-act="rec-set">Route übernehmen</button></div>
         <div class="row" style="margin-top:10px"><button class="btn" data-act="rec" data-r="clear" ${rec ? "" : "disabled"}>Leeren</button>
           <button class="btn" data-act="rec" data-r="test" ${rec && !s.job.running ? "" : "disabled"}>Abspielen</button></div>
         <div class="row" style="margin-top:10px"><input type="text" id="recname" placeholder="Als Raum speichern, z. B. Bad" maxlength="40" style="flex:1" value="${esc(this.recName)}"><button class="btn primary" data-act="rec-save" ${rec ? "" : "disabled"}>Speichern</button></div>
@@ -2632,6 +2645,11 @@ Object.assign(TikomPanel.prototype, {
       /* driving */
       case "drive": await this.act("drive", { direction: t.dataset.d, seconds: Number(s.settings.step_seconds) }); break;
       case "rec": await this.act("recording", { action: t.dataset.r }, t.dataset.r === "test" ? "Spiele ab" : ""); break;
+      case "rec-set": {
+        const route = this.shadowRoot.getElementById("routetext").value;
+        await this.act("recording", { action: "set", route }, "Route übernommen");
+        break;
+      }
       case "rec-save": {
         const name = this.shadowRoot.getElementById("recname").value.trim();
         if (!name) { this.toast("Gib dem Raum einen Namen.", true); return; }
