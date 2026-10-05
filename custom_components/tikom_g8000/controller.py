@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import tempfile
@@ -35,16 +36,32 @@ from .const import (
     DIRECTIONS,
     DOCK_WAIT,
     DOMAIN,
+    LEAVE_DOCK_WAIT,
     MAX_ROUTE_LENGTH,
     ROOM_COLORS,
     START_CHECK_DELAY,
     STORAGE_VERSION,
+    VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 CLEAN_MODES = ("sweep", "mop", "sweep_and_mop")
+START_MODE_KEYS = ("clean", "wall_follow", "random")
+BOOL_SETTINGS = ("verify_leave_dock", "carpet_sweep_only")
+EXPORT_FORMAT = "tikom_g8000_export"
+EXPORT_VERSION = 1
+# settings that travel with an export (selected_room is only a UI memory)
+EXPORT_SETTINGS = (
+    "clean_mode",
+    "start_mode",
+    "min_battery",
+    "step_seconds",
+    "robot_floor",
+    "verify_leave_dock",
+    "carpet_sweep_only",
+)
 FEEDBACK_STEP = 0.05
 # Suffix of the Tuya Local unique_id ("<device>-<config_id>") for every tile
 TUYA_ENTITY_KEYS = {
@@ -65,6 +82,35 @@ TUYA_ENTITY_KEYS = {
     "reset_edge_brush": "button_reset_edge_brush",
     "reset_roll_brush": "button_reset_roll_brush",
 }
+
+
+def clean_setting(key: str, value: Any) -> Any:
+    """Validate one setting value; raise HomeAssistantError when it is not allowed."""
+    if key == "clean_mode":
+        if value not in CLEAN_MODES:
+            raise HomeAssistantError("Unbekannter Modus.")
+        return value
+    if key == "start_mode":
+        if value not in START_MODE_KEYS:
+            raise HomeAssistantError("Unbekannter Modus.")
+        return value
+    if key in BOOL_SETTINGS:
+        if not isinstance(value, bool):
+            raise HomeAssistantError("Ungültiger Wert (an oder aus).")
+        return value
+    if key in ("min_battery", "step_seconds"):
+        if isinstance(value, bool):
+            raise HomeAssistantError("Ungültiger Zahlenwert.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as err:
+            raise HomeAssistantError("Ungültiger Zahlenwert.") from err
+        if not math.isfinite(number):
+            raise HomeAssistantError("Ungültiger Zahlenwert.")
+        if key == "min_battery":
+            return min(max(number, 20.0), 100.0)
+        return min(max(number, 0.5), 30.0)
+    raise HomeAssistantError("Unbekannte Einstellung.")
 
 
 def parse_route(route: str | None) -> list[tuple[str, float]]:
@@ -168,6 +214,8 @@ class Controller:
             "start_mode": "clean",
             "selected_room": None,
             "clean_mode": "sweep_and_mop",
+            "verify_leave_dock": True,
+            "carpet_sweep_only": False,
         }
         settings.update(stored.get("settings", {}))
         calibration = {"speed_cm_s": 25.0, "turn_deg_s": 60.0, "calibrated": False}
@@ -459,7 +507,7 @@ class Controller:
         while f"f{number}" in used:
             number += 1
         return self.save_floor(
-            {"id": f"f{number}", "name": name, "walls": True, "shapes": [], "dock": None}
+            {"id": f"f{number}", "name": name, "walls": True, "open": [], "shapes": [], "dock": None}
         )
 
     @callback
@@ -598,11 +646,39 @@ class Controller:
             if len(kept) != len(floor["shapes"]):
                 floor["shapes"] = kept
                 self._compiled.pop(floor["id"], None)
+            if any(room_id in pair for pair in floor.get("open", [])):
+                floor["open"] = [p for p in floor["open"] if room_id not in p]
+                self._compiled.pop(floor["id"], None)
         del self.rooms[room_id]
         if self.get_setting("selected_room") == room_id:
             self.data["settings"]["selected_room"] = None
         self._changed()
         async_dispatcher_send(self.hass, self.signal_room_removed, room_id)
+
+    # ------------------------------------------------------------------
+    # carpets
+    # ------------------------------------------------------------------
+    def room_has_carpet(self, room_id: str) -> bool:
+        """Whether a carpet is drawn inside the room."""
+        room = self.rooms.get(room_id)
+        floor = self.room_floor(room_id)
+        if room is None or floor is None or not room.get("idx"):
+            return False
+        try:
+            plan = self.compiled(floor["id"])
+        except HomeAssistantError:
+            return False
+        return plan is not None and room["idx"] in planner.carpet_rooms(plan)
+
+    def effective_mode(self, room_id: str, mode: str) -> str:
+        """The mode that really runs: rooms with a carpet can be sweep-only."""
+        if (
+            mode != "sweep"
+            and self.get_setting("carpet_sweep_only")
+            and self.room_has_carpet(room_id)
+        ):
+            return "sweep"
+        return mode
 
     # ------------------------------------------------------------------
     # routes
@@ -616,6 +692,7 @@ class Controller:
         room = self.rooms.get(room_id)
         if room is None:
             raise HomeAssistantError("Raum nicht gefunden.")
+        mode = self.effective_mode(room_id, mode)
         recorded = parse_route(room.get("route"))
         floor = self.room_floor(room_id)
         planned_possible = bool(floor and floor.get("dock") and room.get("idx"))
@@ -674,6 +751,7 @@ class Controller:
         route = self.route_for_room(room_id, mode)
         floor = self.room_floor(room_id)
         return {
+            "mode": self.effective_mode(room_id, mode),
             "source": route["source"],
             "steps": route["steps"],
             "route": steps_to_string(route["steps"]),
@@ -692,6 +770,168 @@ class Controller:
         return {"floor": floor["id"], "line": line} if line else None
 
     # ------------------------------------------------------------------
+    # export and import
+    # ------------------------------------------------------------------
+    def export_data(self) -> dict[str, Any]:
+        """Rooms, floors, calibration and settings, without the background images.
+
+        The panel adds the images (one request per floor) before it saves the file.
+        """
+        rooms = {
+            room_id: {
+                key: room.get(key)
+                for key in ("name", "minutes", "route", "idx", "color", "target", "use_recorded")
+            }
+            for room_id, room in self.rooms.items()
+        }
+        return {
+            "format": EXPORT_FORMAT,
+            "version": EXPORT_VERSION,
+            "app_version": VERSION,
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "settings": {key: self.data["settings"].get(key) for key in EXPORT_SETTINGS},
+            "calibration": dict(self.calibration),
+            "recording": self.recording,
+            "rooms": rooms,
+            "floors": [
+                {
+                    "id": floor["id"],
+                    "name": floor["name"],
+                    "walls": floor["walls"],
+                    "open": floor.get("open", []),
+                    "shapes": floor["shapes"],
+                    "dock": floor["dock"],
+                    "has_image": bool(floor.get("image")),
+                }
+                for floor in self.floors
+            ],
+        }
+
+    @staticmethod
+    def _clean_import_rooms(raw: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, dict) or len(raw) > planner.MAX_ROOMS:
+            raise HomeAssistantError(f"Die Datei hat keine gültigen Räume (höchstens {planner.MAX_ROOMS}).")
+        rooms: dict[str, dict[str, Any]] = {}
+        used: set[int] = set()
+        for room_id, item in raw.items():
+            if not isinstance(room_id, str) or not floorplan.ROOM_ID_RE.match(room_id):
+                raise HomeAssistantError("Die Datei enthält einen ungültigen Raumnamen.")
+            if not isinstance(item, dict):
+                raise HomeAssistantError("Die Datei enthält einen ungültigen Raum.")
+            name = str(item.get("name") or room_id).strip()[:40] or room_id
+            try:
+                minutes = min(max(float(item.get("minutes", DEFAULT_ROOM_MINUTES)), 1.0), 90.0)
+            except (TypeError, ValueError) as err:
+                raise HomeAssistantError(f'Ungültige Minuten bei Raum "{name}".') from err
+            if not math.isfinite(minutes):
+                raise HomeAssistantError(f'Ungültige Minuten bei Raum "{name}".')
+            route = item.get("route") or ""
+            if not isinstance(route, str):
+                raise HomeAssistantError(f'Ungültige Aufnahme bei Raum "{name}".')
+            idx = item.get("idx")
+            if isinstance(idx, bool) or not isinstance(idx, int) or not 1 <= idx < len(planner.ROOM_CHARS) or idx in used:
+                idx = None
+            else:
+                used.add(idx)
+            color = item.get("color")
+            if not isinstance(color, str) or not COLOR_RE.match(color):
+                color = None
+            target = item.get("target")
+            if not (
+                isinstance(target, list)
+                and len(target) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in target)
+                and all(floorplan.COORD_MIN <= v <= floorplan.COORD_MAX for v in target)
+            ):
+                target = None
+            else:
+                target = [round(target[0]), round(target[1])]
+            rooms[room_id] = {
+                "name": name,
+                "minutes": minutes,
+                "route": steps_to_string(parse_route(route)),
+                "idx": idx,
+                "color": color,
+                "target": target,
+                "use_recorded": bool(item.get("use_recorded", False)),
+            }
+        for room in rooms.values():  # rooms without a usable number get a free one
+            if room["idx"] is None:
+                room["idx"] = next(i for i in range(1, len(planner.ROOM_CHARS)) if i not in used)
+                used.add(room["idx"])
+            if room["color"] is None:
+                room["color"] = ROOM_COLORS[(room["idx"] - 1) % len(ROOM_COLORS)]
+        return rooms
+
+    @callback
+    def import_data(self, raw: Any) -> dict[str, Any]:
+        """Replace rooms, floors, calibration and settings with an export.
+
+        Background images are not part of this call (they are large); the panel
+        sends them afterwards, one floor at a time, through the normal floor save.
+        Nothing is changed unless the whole file is valid.
+        """
+        if self.job_running:
+            raise HomeAssistantError("Es läuft gerade ein Raumauftrag. Erst abbrechen oder abwarten.")
+        if not isinstance(raw, dict) or raw.get("format") != EXPORT_FORMAT:
+            raise HomeAssistantError("Das ist keine Exportdatei von Tikom G8000.")
+        if raw.get("version") != EXPORT_VERSION:
+            raise HomeAssistantError("Diese Exportdatei hat ein unbekanntes Format (Version).")
+        rooms = self._clean_import_rooms(raw.get("rooms"))
+        floors_raw = raw.get("floors")
+        if not isinstance(floors_raw, list) or not 1 <= len(floors_raw) <= floorplan.MAX_FLOORS:
+            raise HomeAssistantError(f"Die Datei braucht 1 bis {floorplan.MAX_FLOORS} Stockwerke.")
+        floors: list[dict[str, Any]] = []
+        try:
+            for item in floors_raw:
+                floor = floorplan.clean_floor(item, set(rooms))
+                floor["image"] = None
+                floors.append(floor)
+        except planner.PlanError as err:
+            raise HomeAssistantError(str(err)) from err
+        if len({floor["id"] for floor in floors}) != len(floors):
+            raise HomeAssistantError("Die Datei enthält doppelte Stockwerke.")
+
+        settings = dict(self.data["settings"])
+        raw_settings = raw.get("settings", {})
+        if not isinstance(raw_settings, dict):
+            raise HomeAssistantError("Die Einstellungen in der Datei sind ungültig.")
+        for key in EXPORT_SETTINGS:
+            if key in raw_settings and key != "robot_floor":
+                settings[key] = clean_setting(key, raw_settings[key])
+        robot_floor = raw_settings.get("robot_floor")
+        settings["robot_floor"] = (
+            robot_floor if robot_floor in {floor["id"] for floor in floors} else floors[0]["id"]
+        )
+        settings["selected_room"] = None
+
+        calibration = dict(self.calibration)
+        raw_cal = raw.get("calibration")
+        if isinstance(raw_cal, dict):
+            for key, low, high in (("speed_cm_s", 5.0, 80.0), ("turn_deg_s", 10.0, 360.0)):
+                value = raw_cal.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    calibration[key] = round(min(max(float(value), low), high), 2)
+            calibration["calibrated"] = bool(raw_cal.get("calibrated", False))
+        recording = raw.get("recording", "")
+        recording = steps_to_string(parse_route(recording)) if isinstance(recording, str) else ""
+
+        old_rooms = set(self.rooms)
+        self.data["rooms"] = rooms
+        self.data["floors"] = floors
+        self.data["settings"] = settings
+        self.data["calibration"] = calibration
+        self.data["recording"] = recording[:MAX_ROUTE_LENGTH]
+        self._compiled = {}
+        self.last_run = None
+        self._changed()
+        for room_id in old_rooms - set(rooms):
+            async_dispatcher_send(self.hass, self.signal_room_removed, room_id)
+        for room_id in set(rooms) - old_rooms:
+            async_dispatcher_send(self.hass, self.signal_room_added, room_id)
+        return {"floors": [floor["id"] for floor in floors], "rooms": len(rooms)}
+
+    # ------------------------------------------------------------------
     # snapshot for the panel
     # ------------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
@@ -703,6 +943,7 @@ class Controller:
                 **room,
                 "has_route": bool(parse_route(room.get("route"))),
                 "floor": floor["id"] if floor else None,
+                "has_carpet": self.room_has_carpet(room_id),
             }
         return {
             "entry_id": self.entry.entry_id,
@@ -718,6 +959,7 @@ class Controller:
                     "id": floor["id"],
                     "name": floor["name"],
                     "walls": floor["walls"],
+                    "open": floor.get("open", []),
                     "shapes": floor["shapes"],
                     "dock": floor["dock"],
                     "has_image": bool(floor.get("image")),
@@ -834,14 +1076,41 @@ class Controller:
         if record:
             self.set_recording(new)
 
-    async def async_run_steps(self, steps: list[tuple[str, float]]) -> None:
-        """Drive a list of steps (safety limits are applied again here)."""
+    async def async_run_steps(
+        self,
+        steps: list[tuple[str, float]],
+        verify_leave: bool = False,
+        report: bool = False,
+    ) -> None:
+        """Drive a list of steps (safety limits are applied again here).
+
+        With verify_leave the robot has to report something other than "docked"
+        shortly after the first forward or reverse step. If it still sits on the
+        station, it did not move, and the run stops before anything else happens.
+        With report the current step is shown as the phase of the job.
+        """
         try:
             steps = planner.limit_steps(steps)
         except planner.PlanError as err:
             raise HomeAssistantError(str(err)) from err
-        for direction, seconds in steps:
+        total = len(steps)
+        checked = not verify_leave
+        for number, (direction, seconds) in enumerate(steps, 1):
+            if report:
+                self._set_phase(f"Fahre zum Raum, Schritt {number} von {total}")
             await self.async_drive(direction, seconds, record=False)
+            if not checked and direction in ("forward", "reverse"):
+                checked = True
+                if not await self._wait_for(
+                    lambda: self.vacuum_state() != "docked", LEAVE_DOCK_WAIT
+                ):
+                    raise HomeAssistantError(
+                        "Der Roboter hat die Station nicht verlassen: Er meldet auch "
+                        f"{LEAVE_DOCK_WAIT} Sekunden nach dem ersten Fahrschritt noch "
+                        "„An der Station“. Die Fahrbefehle wurden gesendet, aber er hat "
+                        "sich nicht bewegt. Prüfe im Reiter Fahren, ob Vor oder Zurück "
+                        "ihn von der Station wegbewegen."
+                    )
             await asyncio.sleep(0.7)
 
     async def async_test_recording(self) -> None:
@@ -892,6 +1161,7 @@ class Controller:
         # fail early, before anything moves: every route must be computable
         for room_id in rooms:
             self._require_floor(room_id, self.route_for_room(room_id, mode))
+        self.last_run = None
         self.job_mode = mode
         self.queue = list(rooms)
         self._job = self.hass.async_create_background_task(
@@ -907,6 +1177,7 @@ class Controller:
             raise HomeAssistantError("Raum nicht gefunden.")
         mode = self.get_setting("clean_mode")
         self._require_floor(room_id, self.route_for_room(room_id, mode))
+        self.last_run = None
         self.job_mode = mode
         self.queue = [room_id]
         self._job = self.hass.async_create_background_task(
@@ -930,8 +1201,14 @@ class Controller:
                 "error": str(err),
                 "ts": time.time(),
             }
-        except Exception:  # noqa: BLE001
+        except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Raumauftrag fehlgeschlagen")
+            self.last_run = {
+                "room": self.current_room,
+                "ok": False,
+                "error": f"Unerwarteter Fehler: {err}",
+                "ts": time.time(),
+            }
         finally:
             self.current_room = None
             self.queue = []
@@ -942,6 +1219,8 @@ class Controller:
         room = self.rooms[room_id]
         name = room["name"]
         title = f"Tikom: {name}"
+        mode = self.effective_mode(room_id, mode)
+        self.job_mode = mode
 
         if self.vacuum_state() != "docked":
             self._notify(
@@ -949,13 +1228,16 @@ class Controller:
                 "Der Roboter muss auf der Ladestation stehen (Status docked), "
                 f'ist aber "{self.vacuum_state()}".',
             )
-            raise HomeAssistantError("Roboter nicht auf der Station")
+            raise HomeAssistantError(
+                "Der Roboter muss auf der Station stehen "
+                f'(Status "{self.vacuum_state()}" statt "docked").'
+            )
         route = self.route_for_room(room_id, mode)
         self._require_floor(room_id, route)
 
         battery = self.battery_entity()
         minimum = float(self.get_setting("min_battery"))
-        if battery:
+        if battery and not dry:  # a test drive does not need a full battery
 
             def battery_ok() -> bool:
                 state = self.hass.states.get(battery)
@@ -965,16 +1247,34 @@ class Controller:
                     return True  # unavailable/unknown: do not wait forever
 
             if not battery_ok():
-                self._set_phase("Warte auf Akku")
+                self._set_phase(f"Warte auf Akku (mindestens {minimum:.0f} %)")
             if not await self._wait_for(battery_ok, BATTERY_WAIT):
                 self._notify(title, f"Der Akku hat {minimum:.0f} % nicht erreicht.")
-                raise HomeAssistantError("Akku zu niedrig")
+                raise HomeAssistantError("Der Akku hat die Mindestladung nicht erreicht.")
 
-        self._set_phase("Fahre zum Raum")
-        await self.async_run_steps(route["steps"])
+        steps = route["steps"]
+        self._set_phase(
+            f"Fahre zum Raum ({len(steps)} Schritte, "
+            f"ca. {sum(seconds for _, seconds in steps):.0f} Sekunden)"
+        )
+        try:
+            await self.async_run_steps(
+                steps,
+                verify_leave=bool(self.get_setting("verify_leave_dock")),
+                report=True,
+            )
+        except HomeAssistantError as err:
+            self._notify(title, str(err))
+            raise
 
         if dry:
-            self.last_run = {"room": room_id, "ok": True, "dry": True, "ts": time.time()}
+            self.last_run = {
+                "room": room_id,
+                "ok": True,
+                "dry": True,
+                "ts": time.time(),
+                "steps": len(steps),
+            }
             self._notify(
                 title,
                 "Testfahrt beendet. Prüfe, wo der Roboter steht, gib im Panel "
@@ -992,7 +1292,9 @@ class Controller:
                 title,
                 f'Der Roboter saugt nicht. Status nach dem Start: "{self.vacuum_state()}".',
             )
-            raise HomeAssistantError("Start fehlgeschlagen")
+            raise HomeAssistantError(
+                f'Der Roboter hat die Reinigung nicht gestartet (Status "{self.vacuum_state()}").'
+            )
 
         minutes = float(room["minutes"])
         await self._wait_for(lambda: self.vacuum_state() != "cleaning", minutes * 60)
@@ -1004,8 +1306,16 @@ class Controller:
                 title,
                 f"Nicht zurück an der Station (Status {self.vacuum_state()}).",
             )
-            raise HomeAssistantError("Nicht angedockt")
-        self.last_run = {"room": room_id, "ok": True, "dry": False, "ts": time.time()}
+            raise HomeAssistantError(
+                f'Der Roboter ist nicht zur Station zurückgekehrt (Status "{self.vacuum_state()}").'
+            )
+        self.last_run = {
+            "room": room_id,
+            "ok": True,
+            "dry": False,
+            "ts": time.time(),
+            "steps": len(steps),
+        }
 
     def _cancel_job(self) -> None:
         if self.job_running and self._job is not None:

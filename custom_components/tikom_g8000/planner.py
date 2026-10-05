@@ -191,6 +191,22 @@ def room_cells(grid: Grid, index: int) -> list[tuple[int, int]]:
     ]
 
 
+def carpet_rooms(plan: dict[str, Any]) -> set[int]:
+    """Indexes of the rooms that have a carpet inside them (cached in the plan)."""
+    cached = plan.get("_carpet_rooms")
+    if cached is not None:
+        return cached
+    found: set[int] = set()
+    for row, carpet in zip(plan["rows"], plan["carpet"]):
+        if "1" not in carpet:
+            continue
+        for char, flag in zip(row, carpet):
+            if flag == "1" and char != "0":
+                found.add(ROOM_CHARS.index(char))
+    plan["_carpet_rooms"] = found
+    return found
+
+
 def default_target(
     grid: Grid, index: int, avoid_carpet: bool = False
 ) -> tuple[int, int] | None:

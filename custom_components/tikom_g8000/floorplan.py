@@ -13,8 +13,9 @@ and the geometry type "rect", "ellipse", "poly" (corner points) or
 "stroke" (a freehand line with a width).
 
 Rooms that touch each other get a wall between them automatically; a door
-shape opens it again. Floors can switch this off ("walls": false) for
-open-plan flats.
+shape opens it again. Two rooms can also be declared "open" towards each
+other (floor["open"], a list of room id pairs): no wall is drawn between
+them at all. Floors can switch walls off ("walls": false) for open-plan flats.
 """
 
 from __future__ import annotations
@@ -108,6 +109,37 @@ def clean_dock(raw: Any) -> dict[str, Any] | None:
     }
 
 
+MAX_OPEN_PAIRS = 100
+
+
+def clean_open(raw: Any, room_ids: set[str] | None = None) -> list[list[str]]:
+    """Validate the pairs of rooms that have no wall between them.
+
+    Unknown rooms are dropped silently when room_ids is given (a room may have
+    been deleted since the pair was saved). Pairs are stored sorted, once.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > MAX_OPEN_PAIRS:
+        raise PlanError("Offene Verbindungen ungültig")
+    pairs: list[list[str]] = []
+    for item in raw:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 2
+            or not all(isinstance(r, str) and ROOM_ID_RE.match(r) for r in item)
+        ):
+            raise PlanError("Offene Verbindung ungültig")
+        a, b = sorted(item)
+        if a == b:
+            continue
+        if room_ids is not None and (a not in room_ids or b not in room_ids):
+            continue
+        if [a, b] not in pairs:
+            pairs.append([a, b])
+    return pairs
+
+
 def clean_floor(raw: Any, room_ids: set[str] | None = None) -> dict[str, Any]:
     """Validate a floor (without its image) and return a normalised copy."""
     if not isinstance(raw, dict):
@@ -135,6 +167,7 @@ def clean_floor(raw: Any, room_ids: set[str] | None = None) -> dict[str, Any]:
         "id": floor_id,
         "name": name.strip(),
         "walls": walls,
+        "open": clean_open(raw.get("open"), room_ids),
         "shapes": shapes,
         "dock": clean_dock(raw.get("dock")),
     }
@@ -298,6 +331,10 @@ def compile_floor(floor: dict[str, Any], room_index: dict[str, int]) -> dict[str
             carpet[j][i0:i1] = b"\x01" * (i1 - i0)
 
     original = [row[:] for row in room]
+    open_pairs: set[frozenset[int]] = set()
+    for first, second in floor.get("open") or []:
+        if first in room_index and second in room_index:
+            open_pairs.add(frozenset((room_index[first], room_index[second])))
     walled: set[tuple[int, int]] = set()
     if floor.get("walls", True):
         for j in range(height):
@@ -307,10 +344,20 @@ def compile_floor(floor: dict[str, Any], room_index: dict[str, int]) -> dict[str
                 a = row[i]
                 if not a:
                     continue
-                if i + 1 < width and row[i + 1] and row[i + 1] != a:
+                if (
+                    i + 1 < width
+                    and row[i + 1]
+                    and row[i + 1] != a
+                    and frozenset((a, row[i + 1])) not in open_pairs
+                ):
                     walled.add((i, j))
                     walled.add((i + 1, j))
-                if below is not None and below[i] and below[i] != a:
+                if (
+                    below is not None
+                    and below[i]
+                    and below[i] != a
+                    and frozenset((a, below[i])) not in open_pairs
+                ):
                     walled.add((i, j))
                     walled.add((i, j + 1))
         for i, j in walled:
@@ -326,6 +373,10 @@ def compile_floor(floor: dict[str, Any], room_index: dict[str, int]) -> dict[str
             room[j][i] = original[j][i]
         else:
             room[j][i] = _nearest_room(original, i, j, width, height)
+        # a door that sits up to one cell (10 cm) beside the wall still opens it
+        for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+            if (ni, nj) in walled:
+                room[nj][ni] = original[nj][ni]
 
     for _, spans in paint_all("block"):
         for j, i0, i1 in spans:

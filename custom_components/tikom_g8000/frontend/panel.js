@@ -62,6 +62,11 @@ button { cursor: pointer; }
 .dot.cleaning, .dot.returning { background: var(--tk-ok); box-shadow: 0 0 0 4px rgba(63,178,127,.2); }
 .dot.docked { background: var(--tk-accent); }
 .dot.error { background: var(--tk-bad); }
+.bolt { width: 1em; height: 1em; fill: var(--tk-ok); vertical-align: -0.14em; flex: none; }
+.bolt.full { fill: none; color: var(--tk-ok); }
+.chg { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 500; color: var(--tk-ok); margin-left: 6px; vertical-align: middle; }
+.chg .bolt { width: 16px; height: 16px; }
+.battery b .bolt { width: 15px; height: 15px; margin-right: 3px; }
 .battery { margin-left: auto; text-align: right; min-width: 84px; }
 .battery b { font-size: 20px; font-weight: 600; }
 .bar { height: 6px; border-radius: 3px; background: var(--tk-line); overflow: hidden; margin-top: 4px; }
@@ -316,6 +321,7 @@ const K_MIN = 0.01, K_MAX = 4;       // pixels per cm
 const ROBOT_R = 17, DOCK_GAP = 25;   // cm: robot radius, robot centre to wall
 const SNAP_PX = 9;
 const DOOR_LEN = 90, DOOR_THICK = 20;
+const RULER_W = 30, RULER_H = 22;    // px: width of the left ruler, height of the top ruler
 
 function shapeEdges(s) {
   if (s.t === "rect") {
@@ -528,6 +534,7 @@ class PlanView {
     if (fl?.dock) this._drawDock(c, fl.dock, accent);
     if (edit) this._overlays(c, shapes, selShape, accent, W, H);
     this._guideLines(c, W, H);
+    this._rulers(c, W, H, ink, cs.getPropertyValue("--tk-card").trim() || "#1c1c1c");
     this._scaleBar(c, W, H, ink);
   }
 
@@ -715,10 +722,63 @@ class PlanView {
     c.stroke(); c.setLineDash([]);
   }
 
+  /* rulers on the left and on top: plan coordinates in cm (below 1 m steps) or m */
+  _rulers(c, W, H, ink, bg) {
+    const v = this.view, k = v.k;
+    const major = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000].find((l) => l * k >= 64) || 5000;
+    const per = String(major)[0] === "2" ? 4 : 5, minor = major / per;
+    const inM = major >= 100;
+    const text = (val) => String(inM ? val / 100 : val);
+    const [x0, y0] = this._sw(0, 0), [x1, y1] = this._sw(W, H);
+    c.save();
+    c.globalAlpha = 0.95; c.fillStyle = bg;
+    c.fillRect(0, 0, W, RULER_H); c.fillRect(0, 0, RULER_W, H);
+    c.globalAlpha = 1; c.strokeStyle = ink; c.fillStyle = ink; c.lineWidth = 1;
+    c.font = "600 10px Roboto, system-ui, sans-serif";
+    // top ruler (x)
+    c.beginPath();
+    for (let n = Math.ceil(x0 / minor); n * minor <= x1; n++) {
+      const sx = Math.round((n * minor - v.x) * k) + 0.5;
+      if (sx < RULER_W) continue;
+      const big = n % per === 0;
+      c.globalAlpha = big ? 0.8 : 0.4;
+      c.moveTo(sx, RULER_H); c.lineTo(sx, RULER_H - (big ? 9 : 4));
+    }
+    c.stroke();
+    c.globalAlpha = 0.85; c.textAlign = "left"; c.textBaseline = "top";
+    for (let n = Math.ceil(x0 / major); n * major <= x1; n++) {
+      const sx = (n * major - v.x) * k;
+      if (sx >= RULER_W) c.fillText(text(n * major), Math.round(sx) + 3, 3);
+    }
+    // left ruler (y), labels read from bottom to top
+    c.beginPath();
+    for (let n = Math.ceil(y0 / minor); n * minor <= y1; n++) {
+      const sy = Math.round((n * minor - v.y) * k) + 0.5;
+      if (sy < RULER_H) continue;
+      const big = n % per === 0;
+      c.globalAlpha = big ? 0.8 : 0.4;
+      c.moveTo(RULER_W, sy); c.lineTo(RULER_W - (big ? 9 : 4), sy);
+    }
+    c.stroke();
+    c.globalAlpha = 0.85;
+    for (let n = Math.ceil(y0 / major); n * major <= y1; n++) {
+      const sy = (n * major - v.y) * k;
+      if (sy < RULER_H) continue;
+      c.save(); c.translate(3, Math.round(sy) - 3); c.rotate(-Math.PI / 2); c.fillText(text(n * major), 0, 0); c.restore();
+    }
+    // frame and corner (shows the unit of the labels)
+    c.globalAlpha = 0.35; c.beginPath();
+    c.moveTo(0, RULER_H + 0.5); c.lineTo(W, RULER_H + 0.5); c.moveTo(RULER_W + 0.5, 0); c.lineTo(RULER_W + 0.5, H); c.stroke();
+    c.globalAlpha = 1; c.fillStyle = bg; c.fillRect(0, 0, RULER_W, RULER_H);
+    c.fillStyle = ink; c.globalAlpha = 0.9; c.textAlign = "center"; c.textBaseline = "middle";
+    c.fillText(inM ? "m" : "cm", RULER_W / 2, RULER_H / 2 + 0.5);
+    c.restore();
+  }
+
   _scaleBar(c, W, H, ink) {
     const k = this.view.k;
     const L = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000].find((l) => l * k >= 56) || 5000;
-    const w = L * k, x = 12, y = H - 14;
+    const w = L * k, x = RULER_W + 12, y = H - 14;
     c.globalAlpha = 0.85; c.strokeStyle = ink; c.fillStyle = ink; c.lineWidth = 2;
     c.beginPath(); c.moveTo(x, y - 4); c.lineTo(x, y); c.lineTo(x + w, y); c.lineTo(x + w, y - 4); c.stroke();
     c.font = "600 11px Roboto, system-ui, sans-serif"; c.textAlign = "left"; c.textBaseline = "bottom";
@@ -906,6 +966,7 @@ class PlanView {
     const [x, y] = this._sw(sx, sy), touch = e.pointerType !== "mouse";
     const pan = { k: "pan", sx, sy, vx: this.view.x, vy: this.view.y, moved: false, t: performance.now() };
     if (e.button === 1 || e.button === 2) { this._op = pan; return; }
+    if (sx < RULER_W || sy < RULER_H) { this._op = pan; return; }   // the rulers only pan
     const edit = this.mode === "edit";
     const tool = edit ? this.tool : "view";
     if (tool === "select") {
@@ -1353,7 +1414,7 @@ class TikomPanel extends HTMLElement {
     this.images = {}; this.imgOver = {}; this.imgLoading = {}; this.imgDirty = false; this.imgRev = 0;
     this.imgStep = ""; this.scaleAsk = null;
     this.det = { thresh: null, invert: false, thin: null, thinUsed: null, gap: 100, minM2: 2, cands: [], ran: false, busy: false, note: "" };
-    this.confirm = ""; this.fbDismissed = ""; this.calSeconds = { speed: 5, turn: 3 }; this.recName = "";
+    this.confirm = ""; this.fbDismissed = ""; this.errDismissed = ""; this.imp = null; this.calSeconds = { speed: 5, turn: 3 }; this.recName = "";
     this.polyN = 0; this._needFit = true; this.pending = false; this._renderPending = false;
 
     const pv = this.pv = new PlanView();
@@ -1431,7 +1492,7 @@ class TikomPanel extends HTMLElement {
   floorName(id) { return this.floors().find((f) => f.id === id)?.name || ""; }
   _floorFromSnap(id) {
     const f = this.floors().find((q) => q.id === id);
-    return f ? { id: f.id, name: f.name, walls: f.walls, shapes: JSON.parse(JSON.stringify(f.shapes)), dock: f.dock ? { ...f.dock } : null } : null;
+    return f ? { id: f.id, name: f.name, walls: f.walls, open: JSON.parse(JSON.stringify(f.open || [])), shapes: JSON.parse(JSON.stringify(f.shapes)), dock: f.dock ? { ...f.dock } : null } : null;
   }
   roomsHere() {
     return Object.entries(this.snap?.rooms || {}).filter(([, r]) => r.floor === this.fid || r.floor === null);
@@ -1506,13 +1567,13 @@ class TikomPanel extends HTMLElement {
   _canonFloor(f) {
     const d = f.dock;
     return {
-      id: f.id, name: f.name, walls: !!f.walls, shapes: f.shapes.map((s) => this._canon(s)),
+      id: f.id, name: f.name, walls: !!f.walls, open: (f.open || []).map((p) => [p[0], p[1]]), shapes: f.shapes.map((s) => this._canon(s)),
       dock: d ? { x: Math.round(d.x), y: Math.round(d.y), heading: Math.round(d.heading), facing: d.facing === "out" ? "out" : "in" } : null,
     };
   }
 
   /* ---- undo and saving */
-  _state() { return JSON.stringify({ name: this.fl.name, walls: this.fl.walls, shapes: this.fl.shapes, dock: this.fl.dock }); }
+  _state() { return JSON.stringify({ name: this.fl.name, walls: this.fl.walls, open: this.fl.open, shapes: this.fl.shapes, dock: this.fl.dock }); }
   _pushUndo() { if (!this.fl) return; this.undo.push(this._state()); if (this.undo.length > 60) this.undo.shift(); }
   _undo() {
     const j = this.undo.pop();
@@ -1584,7 +1645,7 @@ class TikomPanel extends HTMLElement {
     const id = [...this.sel][0], s = this.snap;
     const mode = s.settings.clean_mode || "sweep_and_mop";
     const f = s.floors.find((q) => q.id === s.rooms[id]?.floor);
-    const key = id ? `${id}|${mode}|${JSON.stringify(s.calibration)}|${JSON.stringify(f ? [f.shapes, f.dock, f.walls] : null)}|${s.rooms[id]?.use_recorded}|${s.rooms[id]?.target}` : "";
+    const key = id ? `${id}|${mode}|${JSON.stringify(s.calibration)}|${JSON.stringify(f ? [f.shapes, f.dock, f.walls, f.open] : null)}|${s.settings.carpet_sweep_only}|${s.rooms[id]?.use_recorded}|${s.rooms[id]?.target}` : "";
     if (key === this.previewKey) return;
     this.previewKey = key;
     if (!id) { this.preview = null; this._lines(); this.pv.draw(); return; }
@@ -1604,7 +1665,7 @@ class TikomPanel extends HTMLElement {
     const s = this.snap, h = this._hass;
     if (!s || !h) return "x";
     const ids = [s.vacuum, ...Object.values(s.entities)];
-    return ids.map((id) => { const st = h.states[id]; return st ? `${st.state}` : "-"; }).join("|");
+    return ids.map((id) => { const st = h.states[id]; return st ? `${st.state}${id === s.vacuum ? `/${st.attributes?.status ?? ""}` : ""}` : "-"; }).join("|");
   }
   ent(key) { const id = this.snap?.entities[key]; return id ? this._hass.states[id] : null; }
   num(key) { const st = this.ent(key); const n = st ? parseFloat(st.state) : NaN; return Number.isFinite(n) ? n : null; }
@@ -1661,15 +1722,26 @@ class TikomPanel extends HTMLElement {
     this.scrollTop = scroll;
   }
 
+  /* charging: Tuya Local passes the robot's own status on as an attribute of the vacuum */
+  _charge() {
+    const raw = this._hass.states[this.snap.vacuum]?.attributes?.status;
+    if (this.vacState() !== "docked") return "";
+    return raw === "charging" ? "charging" : raw === "charged" ? "full" : "";
+  }
+
   _statusCard() {
     const s = this.snap, st = this.vacState();
-    const bat = this.num("battery");
+    const bat = this.num("battery"), charge = this._charge();
     const room = s.job.running && s.job.room ? s.rooms[s.job.room]?.name : "";
     const sub = s.job.running ? [room && `Raum ${room}`, s.job.phase].filter(Boolean).join(", ") : (this.ent("problem")?.state === "on" ? "Der Roboter meldet ein Problem" : "");
     const barClass = bat !== null && bat < 20 ? "bad" : bat !== null && bat < 40 ? "warn" : "";
+    const chargeTxt = charge === "charging" ? "Lädt" : charge === "full" ? "Voll geladen" : "";
+    const bolt = charge === "charging"
+      ? `<svg class="bolt" viewBox="0 0 24 24" role="img" aria-label="Lädt"><title>Lädt</title><path d="M13.2 2 5 13.4h5.6L9.4 22 19 9.8h-6z"/></svg>`
+      : charge === "full" ? `<svg class="bolt full" viewBox="0 0 24 24" role="img" aria-label="Voll geladen"><title>Voll geladen</title><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>` : "";
     return `<div class="card"><div class="status"><span class="dot ${esc(st)}"></span>
-      <div><div class="big">${esc(STATE_TEXT[st] || st)}</div><div class="hint">${esc(sub)}</div></div>
-      <div class="battery">${bat === null ? "" : `<b class="num">${Math.round(bat)} %</b><div class="bar ${barClass}"><i style="width:${Math.min(100, bat)}%"></i></div>`}</div></div>
+      <div><div class="big">${esc(STATE_TEXT[st] || st)}${chargeTxt ? ` <span class="chg ${charge}">${bolt}${esc(chargeTxt)}</span>` : ""}</div><div class="hint">${esc(sub)}</div></div>
+      <div class="battery">${bat === null ? "" : `<b class="num">${charge === "charging" ? bolt : ""}${Math.round(bat)} %</b><div class="bar ${barClass}"><i style="width:${Math.min(100, bat)}%"></i></div>`}</div></div>
       <div class="row" style="margin-top:12px">
         <button class="btn" data-act="svc" data-s="start">Start</button>
         <button class="btn" data-act="svc" data-s="pause">Pause</button>
@@ -1735,10 +1807,23 @@ class TikomPanel extends HTMLElement {
          <div style="margin-top:8px"><button class="btn" data-act="robot-here" data-floor="${esc(wrong)}">Roboter steht jetzt im Stockwerk „${esc(this.floorName(wrong))}“</button></div></div>`
       : "";
     const ok = picked.length && docked && !this.preview?.error && !wrong;
+    const carpetRooms = [...this.sel].filter((id) => s.rooms[id]?.has_carpet).map((id) => s.rooms[id].name);
+    let carpetHtml = "";
+    if (carpetRooms.length && mode !== "sweep") {
+      carpetHtml = s.settings.carpet_sweep_only
+        ? `<div class="notice ok small" style="margin-top:10px">${esc(carpetRooms.join(", "))}: Im Raum liegt ein Teppich, deshalb wird dort nur gesaugt (Einstellung unter „Zubehör“).</div>`
+        : `<div class="notice small" style="margin-top:10px">${esc(carpetRooms.join(", "))}: Im Raum liegt ein Teppich. Der Plan umgeht ihn auf dem Weg dorthin. Im Raum selbst bestimmt der Roboter, wo er fährt, der Plan kann ihm den Teppich nicht verbieten.
+           <div style="margin-top:8px"><button class="btn" data-act="carpet-only-on">Räume mit Teppich nur saugen</button></div></div>`;
+    }
+    const lr = s.last_run;
+    const errHtml = lr && lr.error && this.errDismissed !== JSON.stringify(lr)
+      ? `<div class="notice bad" style="margin-top:10px"><b>Letzter Auftrag${lr.room && s.rooms[lr.room] ? ` (${esc(s.rooms[lr.room].name)})` : ""} abgebrochen:</b> ${esc(lr.error)}
+         <div style="margin-top:8px"><button class="btn" data-act="err-ok">Okay</button></div></div>`
+      : "";
     return `<div class="card"><h2>Reinigen</h2>
       <p style="margin-bottom:10px">${picked.length ? esc(picked.join(", ")) : "Kein Raum gewählt"}</p>
       <div class="seg full" style="margin-bottom:12px">${Object.entries(MODE_TEXT).map(([k, t]) => `<button data-act="mode" data-mode="${k}" aria-pressed="${mode === k}">${t}</button>`).join("")}</div>
-      ${info}${wrongHtml}
+      ${info}${wrongHtml}${carpetHtml}${errHtml}
       ${docked ? "" : `<div class="notice" style="margin-top:10px">Der Roboter muss auf der Station stehen, sonst startet kein Raumauftrag.</div>`}
       <div class="row" style="margin-top:12px"><button class="btn primary big" data-act="clean" ${ok ? "" : "disabled"}>Los</button></div>
       <div class="row" style="margin-top:8px"><button class="btn" data-act="dry" ${ok ? "" : "disabled"}>Nur hinfahren (Test)</button></div></div>`;
@@ -1850,7 +1935,12 @@ class TikomPanel extends HTMLElement {
     return `<div class="grid"><div><div class="card"><h2>Zubehör: verbleibende Zeit</h2>${supplies || `<p class="hint">Die Zubehör-Werte kommen von Tuya Local. Sie erscheinen, sobald der Roboter mit dem Typ „tikom_g8000_robot_vacuum_mop“ eingerichtet ist.</p>`}</div>
       <div class="card"><h2>Letzte Reinigung</h2><div class="row between"><span>Fläche</span><span class="num">${area === null ? "–" : `${area} m²`}</span></div>
         <div class="row between"><span>Dauer</span><span class="num">${time === null ? "–" : `${time} Min.`}</span></div></div></div>
-      <div><div class="card"><h2>Einstellungen</h2><div class="stack">${settings || `<p class="hint">Noch keine Einstellungen gefunden.</p>`}</div></div></div></div>`;
+      <div><div class="card"><h2>Einstellungen</h2><div class="stack">${settings || `<p class="hint">Noch keine Einstellungen gefunden.</p>`}</div></div>
+      <div class="card"><h2>Raumaufträge</h2><div class="stack">
+        <label class="toggle"><span>Räume mit Teppich nur saugen</span><input type="checkbox" data-change="bool-setting" data-key="carpet_sweep_only" ${this.snap.settings.carpet_sweep_only ? "checked" : ""}></label>
+        <p class="hint">Der Plan kennt deine Teppiche und umgeht sie auf dem Weg. Im Raum fährt der Roboter selbst. Erkennt seine eigene Teppicherkennung (oben) den Teppich nicht, hilft nur, in diesen Räumen nicht zu wischen.</p>
+        <label class="toggle"><span>Prüfen, ob er die Station verlassen hat</span><input type="checkbox" data-change="bool-setting" data-key="verify_leave_dock" ${this.snap.settings.verify_leave_dock ? "checked" : ""}></label>
+        <p class="hint">Nach dem ersten Fahrschritt muss der Roboter sich von „An der Station“ lösen. Sonst bricht der Auftrag ab, statt an der Station zu reinigen.</p></div></div></div></div>`;
   }
 }
 
@@ -1944,7 +2034,7 @@ Object.assign(TikomPanel.prototype, {
         ${tool === "draw" ? this._drawOptions() : ""}
         <div class="plan-wrap" id="planslot"></div>
         <p class="hint" style="margin-top:8px">${esc(this._planHint())} <span id="savestate" class="saved">${esc(this.saveState)}</span></p></div></div>
-      <div>${this._scaleCard()}${this._inspector()}${imageFirst ? this._imageCard() : ""}${this._roomsCard()}${this._dockCard()}${this._floorCard()}${imageFirst ? "" : this._imageCard()}</div></div>`;
+      <div>${this._scaleCard()}${this._inspector()}${imageFirst ? this._imageCard() : ""}${this._roomsCard()}${this._dockCard()}${this._floorCard()}${imageFirst ? "" : this._imageCard()}${this._backupCard()}</div></div>`;
   },
 
   /* ---- selection */
@@ -2023,15 +2113,51 @@ Object.assign(TikomPanel.prototype, {
   },
 
   /* ---- floor settings */
+  _openPairs() {
+    const f = this.fl, nm = (id) => this.snap.rooms[id]?.name || id;
+    if (!f.walls) return "";
+    const here = [...new Set(f.shapes.filter((x) => x.kind === "room").map((x) => x.room))].filter((id) => this.snap.rooms[id]);
+    const list = (f.open || []).filter(([a, b]) => this.snap.rooms[a] && this.snap.rooms[b]);
+    const chips = list.length
+      ? `<div class="chips">${list.map(([a, b], i) => `<span class="chip">${esc(nm(a))} ⟷ ${esc(nm(b))}<button class="link" data-act="open-del" data-a="${esc(a)}" data-b="${esc(b)}" aria-label="Verbindung ${esc(nm(a))} und ${esc(nm(b))} entfernen">✕</button></span>`).join("")}</div>`
+      : "";
+    const opts = (sel) => here.map((id) => `<option value="${esc(id)}" ${id === sel ? "selected" : ""}>${esc(nm(id))}</option>`).join("");
+    const adder = here.length >= 2
+      ? `<div class="row"><select id="open-a" aria-label="Erster Raum" style="flex:1;min-width:110px">${opts(here[0])}</select><span class="hint">und</span>
+          <select id="open-b" aria-label="Zweiter Raum" style="flex:1;min-width:110px">${opts(here[1])}</select>
+          <button class="btn" data-act="open-add">Ohne Wand verbinden</button></div>`
+      : `<p class="hint">Dafür braucht es mindestens zwei gezeichnete Räume in diesem Stockwerk.</p>`;
+    return `<h3 style="margin:2px 0 0">Räume ohne Wand dazwischen</h3>
+      <p class="hint">Für Räume, die ohne Tür ineinander übergehen, zum Beispiel ein Flur in L-Form und das Wohnzimmer. Zwischen den beiden Räumen entsteht dann keine Wand, überall wo sie sich berühren.</p>${chips}${adder}`;
+  },
+
   _floorCard() {
     const f = this.fl, many = this.floors().length > 1, rf = this.snap.robot_floor;
     return `<div class="card"><h2>Stockwerk</h2><div class="stack">
       <label class="field">Name<input type="text" value="${esc(f.name)}" maxlength="30" data-change="floor-name"></label>
       <label class="toggle"><span>Wände zwischen Räumen automatisch</span><input type="checkbox" data-change="floor-walls" ${f.walls ? "checked" : ""}></label>
-      <p class="hint">Wenn zwei Räume sich berühren, zieht die App dazwischen eine Wand. Türen öffnen sie. Für offene Wohnbereiche ohne Wände ausschalten.</p>
+      <p class="hint">Wenn zwei Räume sich berühren, zieht die App dazwischen eine Wand. Türen öffnen sie. Für offene Wohnbereiche ohne Wände ausschalten, oder unten einzelne Räume ohne Wand verbinden.</p>
+      ${this._openPairs()}
       ${many ? (rf === f.id ? `<div class="notice ok small">Der Roboter steht laut Plan in diesem Stockwerk.</div>` : `<div class="notice small">Der Roboter steht laut Plan im Stockwerk „${esc(this.floorName(rf))}“.<div style="margin-top:8px"><button class="btn" data-act="robot-here" data-floor="${esc(f.id)}">Roboter steht jetzt hier</button></div></div>`) : ""}
       ${many ? `<div><button class="btn ${this.confirm === "floor" ? "danger" : ""}" data-act="floor-del">${this.confirm === "floor" ? "Wirklich löschen? Räume dieses Stockwerks werden mit gelöscht" : "Stockwerk löschen"}</button></div>` : ""}
       </div></div>`;
+  },
+
+  /* ---- export and import of everything */
+  _backupCard() {
+    const imp = this.imp;
+    let state = "";
+    if (imp?.error) state = `<div class="notice bad" style="margin-top:10px">${esc(imp.error)}</div>`;
+    else if (imp) {
+      const when = imp.at ? new Date(imp.at).toLocaleDateString("de-DE") : "";
+      state = `<div class="notice" style="margin-top:10px"><b>${esc(imp.name)}</b>${when ? ` (vom ${esc(when)})` : ""}: ${imp.floors} ${imp.floors === 1 ? "Stockwerk" : "Stockwerke"}, ${imp.rooms} ${imp.rooms === 1 ? "Raum" : "Räume"}${imp.images ? `, ${imp.images} ${imp.images === 1 ? "Grundriss" : "Grundrisse"}` : ""}.
+        <div class="small" style="margin-top:4px">Beim Laden wird der jetzige Plan mit allen Stockwerken, Räumen, Messwerten und diesen Einstellungen ersetzt.</div>
+        <div class="row" style="margin-top:8px"><button class="btn primary" data-act="import-do" ${imp.busy ? "disabled" : ""}>${imp.busy ? "Lädt …" : "Jetzt ersetzen"}</button><button class="btn" data-act="import-cancel" ${imp.busy ? "disabled" : ""}>Abbrechen</button></div></div>`;
+    }
+    return `<div class="card"><h2>Sichern und übertragen</h2>
+      <p class="hint">Speichert alles in einer Datei: Stockwerke mit Plan und Grundriss-Bildern, Räume, Messwerte und Einstellungen. Zum Sichern oder um alles in eine andere Installation zu übernehmen.</p>
+      <div class="row" style="margin-top:10px"><button class="btn primary" data-act="export" ${this.busyExport ? "disabled" : ""}>${this.busyExport ? "Exportiert …" : "Alles exportieren"}</button>
+        <label class="btn" style="cursor:pointer">Aus Datei laden<input type="file" accept="application/json,.json" data-change="import-file" hidden></label></div>${state}</div>`;
   },
 
   /* ---- floor plan image */
@@ -2237,6 +2363,61 @@ Object.assign(TikomPanel.prototype, {
     if (made) this.toast(`${made} Räume angelegt. Benenne sie in der Liste um und setze die Türen.`);
   },
 
+  /* ---- export and import */
+  async _export() {
+    if (this.busyExport) return;
+    this.busyExport = true; this._render();
+    try {
+      await this._save();
+      const data = await this.ws("export");
+      for (const f of data.floors) {
+        if (f.has_image) { const r = await this.ws("get_image", { floor_id: f.id }); f.image = r?.image || null; }
+        delete f.has_image;
+      }
+      const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = `tikom-g8000-export-${new Date().toISOString().slice(0, 10)}.json`;
+      this.shadowRoot.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      this.toast(`Exportiert: ${data.floors.length} Stockwerke, ${Object.keys(data.rooms).length} Räume.`);
+    } catch (err) { this.toast(err?.message || String(err), true); }
+    this.busyExport = false; this._render();
+  },
+  async _readImport(file) {
+    if (!file) return;
+    try {
+      if (file.size > 64e6) throw new Error("Die Datei ist zu groß.");
+      const data = JSON.parse(await file.text());
+      if (data?.format !== "tikom_g8000_export") throw new Error("Das ist keine Exportdatei von Tikom G8000.");
+      if (data.version !== 1) throw new Error("Diese Exportdatei hat ein unbekanntes Format.");
+      const floors = Array.isArray(data.floors) ? data.floors : [];
+      this.imp = { name: file.name, data, floors: floors.length, rooms: Object.keys(data.rooms || {}).length, images: floors.filter((f) => f.image).length, at: data.exported_at || "" };
+    } catch (err) {
+      this.imp = { error: err instanceof SyntaxError ? "Die Datei ist kein gültiges JSON." : (err?.message || String(err)) };
+    }
+    this._render();
+  },
+  async _import() {
+    const imp = this.imp;
+    if (!imp || imp.error || imp.busy) return;
+    const data = JSON.parse(JSON.stringify(imp.data)), images = {};
+    for (const f of data.floors) { if (f.image) images[f.id] = f.image; delete f.image; delete f.has_image; }
+    imp.busy = true; this._render();
+    clearTimeout(this.saveTimer); this.dirty = false; this.imgDirty = false;
+    const r = await this.act("import", { data });
+    if (!r) { imp.busy = false; this._render(); return; }
+    let lost = 0;
+    for (const f of data.floors) {
+      if (!images[f.id]) continue;
+      try { await this.ws("floor", { action: "save", floor: f, image: images[f.id] }); } catch (err) { lost++; }
+    }
+    this.imp = null; this.images = {}; this.imgOver = {}; this.undo = []; this.sel.clear(); this.preview = null; this.previewKey = "";
+    this.pv.sel = null; this.pv.cands = []; this.det.cands = []; this.det.ran = false; this.scaleAsk = null; this.imgStep = "";
+    this.fid = ""; this.fl = null; this._needFit = true;
+    if (this.snap) this._onSnap(this.snap);
+    this.toast(lost ? `Geladen, aber ${lost} Grundriss-Bild(er) wurden nicht übernommen.` : `Geladen: ${r.rooms} Räume in ${r.floors.length} Stockwerken.`, !!lost);
+  },
+
   /* ---- shape editing */
   _deleteSelection() {
     const pv = this.pv, fl = this.fl;
@@ -2292,6 +2473,8 @@ Object.assign(TikomPanel.prototype, {
       case "clean": await this.act("clean", { rooms: [...this.sel], mode: s.settings.clean_mode }, "Los geht's"); break;
       case "dry": await this.act("clean", { rooms: [[...this.sel][0]], dry_run: true }, "Testfahrt gestartet"); break;
       case "abort": await this.act("abort", {}, "Abgebrochen"); break;
+      case "err-ok": this.errDismissed = JSON.stringify(s.last_run); this._render(); break;
+      case "carpet-only-on": await this.act("setting", { key: "carpet_sweep_only", value: true }, "Räume mit Teppich werden nur gesaugt"); break;
       case "fb": await this.act("calibration", { action: "feedback", kind: t.dataset.kind }, "Danke, Messwerte angepasst"); this.fbDismissed = JSON.stringify(s.last_run); this._render(); break;
       case "fb-ok": this.fbDismissed = JSON.stringify(s.last_run); this._render(); break;
       case "select": this.svc("select", "select_option", { entity_id: t.dataset.ent, option: t.dataset.opt }); break;
@@ -2313,6 +2496,21 @@ Object.assign(TikomPanel.prototype, {
         this.confirm = ""; this.dirty = false; this.imgDirty = false;
         await this.act("floor", { action: "delete", floor_id: this.fid }, "Stockwerk gelöscht");
         break;
+      case "open-add": {
+        const a = this.shadowRoot.getElementById("open-a")?.value, b = this.shadowRoot.getElementById("open-b")?.value;
+        if (!a || !b || a === b) { this.toast("Wähle zwei verschiedene Räume.", true); break; }
+        const pair = [a, b].sort();
+        if ((this.fl.open || []).some((p) => p[0] === pair[0] && p[1] === pair[1])) { this.toast("Diese beiden sind schon verbunden."); break; }
+        this._pushUndo(); this.fl.open = [...(this.fl.open || []), pair]; this._edited(true); break;
+      }
+      case "open-del": {
+        this._pushUndo();
+        this.fl.open = (this.fl.open || []).filter((p) => !(p[0] === t.dataset.a && p[1] === t.dataset.b));
+        this._edited(true); break;
+      }
+      case "export": await this._export(); break;
+      case "import-do": await this._import(); break;
+      case "import-cancel": this.imp = null; this._render(); break;
       case "robot-here": await this.act("floor", { action: "robot_here", floor_id: t.dataset.floor }, "Gemerkt: Der Roboter steht in diesem Stockwerk."); break;
 
       /* tools and view */
@@ -2436,6 +2634,8 @@ Object.assign(TikomPanel.prototype, {
       case "room-minutes": await this.act("room", { action: "update", room_id: t.dataset.room, minutes: Number(t.value) }); break;
       case "room-src": await this.act("room", { action: "update", room_id: t.dataset.room, use_recorded: t.value === "rec" }); break;
       case "step-seconds": await this.act("setting", { key: "step_seconds", value: Number(t.value) }); break;
+      case "bool-setting": await this.act("setting", { key: t.dataset.key, value: t.checked }); break;
+      case "import-file": this._readImport(t.files?.[0]); t.value = ""; break;
       case "cal-sec-speed": this.calSeconds.speed = clamp(Number(t.value) || 5, 1, 30); break;
       case "cal-sec-turn": this.calSeconds.turn = clamp(Number(t.value) || 3, 1, 30); break;
 

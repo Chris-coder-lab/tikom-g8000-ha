@@ -1,7 +1,7 @@
 """Constants for Tikom G8000."""
 
 DOMAIN = "tikom_g8000"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 CONF_VACUUM = "vacuum_entity"
 
@@ -28,6 +28,7 @@ DEFAULT_ROOM_MINUTES = 10
 MAX_ROUTE_LENGTH = 255
 
 START_CHECK_DELAY = 20  # Sekunden bis geprüft wird, ob er wirklich saugt
+LEAVE_DOCK_WAIT = 8  # Sekunden, die er nach dem ersten Fahrschritt Zeit hat, die Station zu verlassen
 BATTERY_WAIT = 3 * 3600  # max. Wartezeit auf Akku
 DOCK_WAIT = 25 * 60  # max. Wartezeit auf Rückkehr zur Station
 

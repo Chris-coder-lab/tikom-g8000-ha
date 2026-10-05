@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -14,7 +13,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import DIRECTIONS, DOMAIN
-from .controller import CLEAN_MODES, Controller
+from .controller import CLEAN_MODES, Controller, clean_setting
 
 NAME = vol.All(str, vol.Length(min=1, max=40))
 ROOM_ID = vol.All(str, vol.Length(min=1, max=60), vol.Match(r"^[a-z0-9_]+$"))
@@ -260,29 +259,35 @@ async def ws_calibration(hass, c, msg):
 @_command(
     {
         vol.Required("type"): f"{DOMAIN}/setting",
-        vol.Required("key"): vol.In(["clean_mode", "start_mode", "min_battery", "step_seconds"]),
-        vol.Required("value"): vol.Any(str, int, float),
+        vol.Required("key"): vol.In(
+            [
+                "clean_mode",
+                "start_mode",
+                "min_battery",
+                "step_seconds",
+                "verify_leave_dock",
+                "carpet_sweep_only",
+            ]
+        ),
+        vol.Required("value"): vol.Any(str, int, float, bool),
     }
 )
 async def ws_setting(hass, c, msg):
     """Change one of the few settings."""
-    key, value = msg["key"], msg["value"]
-    if key == "clean_mode" and value not in CLEAN_MODES:
-        raise HomeAssistantError("Unbekannter Modus.")
-    if key == "start_mode" and value not in ("clean", "wall_follow", "random"):
-        raise HomeAssistantError("Unbekannter Modus.")
-    if key in ("min_battery", "step_seconds"):
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as err:
-            raise HomeAssistantError("Ungültiger Zahlenwert.") from err
-        if not math.isfinite(number):
-            raise HomeAssistantError("Ungültiger Zahlenwert.")
-        value = min(max(number, 20.0), 100.0) if key == "min_battery" else min(
-            max(number, 0.5), 30.0
-        )
-    c.set_setting(key, value)
+    c.set_setting(msg["key"], clean_setting(msg["key"], msg["value"]))
     return {}
+
+
+@_command({vol.Required("type"): f"{DOMAIN}/export"})
+async def ws_export(hass, c, msg):
+    """Plan, rooms, calibration and settings (the panel adds the images)."""
+    return c.export_data()
+
+
+@_command({vol.Required("type"): f"{DOMAIN}/import", vol.Required("data"): dict})
+async def ws_import(hass, c, msg):
+    """Replace plan, rooms, calibration and settings with an export file."""
+    return c.import_data(msg["data"])
 
 
 @websocket_api.require_admin
@@ -334,6 +339,8 @@ def async_register(hass: HomeAssistant) -> None:
         ws_recording,
         ws_calibration,
         ws_setting,
+        ws_export,
+        ws_import,
         ws_subscribe,
     ):
         websocket_api.async_register_command(hass, handler)
